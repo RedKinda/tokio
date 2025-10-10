@@ -132,7 +132,7 @@ impl Driver {
                 feature = "fs",
                 target_os = "linux",
             ))]
-            uring_fd: AtomicU32::new(0), // 0 should be stdin so we can use it as a placeholder for an uninitialized state
+            uring_fd: AtomicU32::new(i32::MAX as u32 + 1), // fd is i32, i32::MAX+1 means uninitialized
         };
 
         Ok((driver, handle))

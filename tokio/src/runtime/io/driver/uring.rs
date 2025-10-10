@@ -157,7 +157,7 @@ impl Handle {
             let ctx = cell.get_or_init(|| {
                 let mut ctx = UringContext::new();
                 let uring_fd = self.uring_fd.load(Ordering::Acquire);
-                let uring_fd = if uring_fd == 0 {
+                let uring_fd = if uring_fd == i32::MAX as u32 + 1 {
                     None
                 } else {
                     Some(uring_fd as i32)
@@ -168,7 +168,7 @@ impl Handle {
                 } else {
                     let fd = ctx.ring().as_raw_fd();
                     if let Err(e) = self.uring_fd.compare_exchange(
-                        0,
+                        i32::MAX as u32 + 1,
                         fd as u32,
                         Ordering::Acquire,
                         Ordering::Acquire,
