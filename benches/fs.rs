@@ -3,16 +3,18 @@
 use tokio_stream::StreamExt;
 
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use std::fs::File as StdFile;
 use std::io::Read as StdRead;
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
         .worker_threads(2)
         .build()
         .unwrap()
@@ -102,11 +104,61 @@ fn sync_read(c: &mut Criterion) {
     });
 }
 
+fn async_write_one(c: &mut Criterion) {
+    let rt = rt();
+
+    const WRITE_SIZE: usize = 10 * 1024;
+    let data: &'static mut [u8] = Box::leak(vec![0u8; WRITE_SIZE].into_boxed_slice());
+
+    c.bench_function("async_write_one", |b| {
+        b.iter(|| {
+            let task = || async {
+                let mut file = File::open("/dev/null").await.unwrap();
+                file.write_all(data).await.unwrap();
+            };
+
+            rt.block_on(task());
+        });
+    });
+}
+
+fn async_write_a_lot(c: &mut Criterion) {
+    let rt = rt();
+
+    const WRITE_SIZE: usize = 10 * 1024;
+    let data: &'static mut [u8] = Box::leak(vec![0u8; WRITE_SIZE].into_boxed_slice());
+
+    c.bench_function("async_write_a_lot", |b| {
+        b.iter(|| {
+            let task_inner = || async {
+                let mut file = File::open("/dev/null").await.unwrap();
+                file.write_all(data).await.unwrap();
+            };
+
+            let task = || async {
+                let mut tasks = vec![];
+                for _ in 0..1 {
+                    tasks.push(tokio::spawn(async move {
+                        task_inner().await;
+                    }));
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+            };
+
+            rt.block_on(task());
+        });
+    });
+}
+
 criterion_group!(
     file,
     async_read_std_file,
     async_read_buf,
     async_read_codec,
-    sync_read
+    sync_read,
+    async_write_one,
+    async_write_a_lot
 );
 criterion_main!(file);

@@ -2,7 +2,7 @@
 //!
 //! [`File`]: File
 
-use crate::fs::{asyncify, OpenOptions};
+use crate::fs::{OpenOptions, asyncify};
 use crate::io::blocking::{Buf, DEFAULT_MAX_BUF_SIZE};
 use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use crate::sync::Mutex;
@@ -15,7 +15,7 @@ use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 #[cfg(test)]
 use super::mocks::JoinHandle;
@@ -107,7 +107,28 @@ struct Inner {
 #[derive(Debug)]
 enum State {
     Idle(Option<Buf>),
-    Busy(JoinHandle<(Operation, Buf)>),
+    Busy(JoinHandleInner<(Operation, Buf)>),
+}
+
+#[derive(Debug)]
+enum JoinHandleInner<T> {
+    Blocking(JoinHandle<T>),
+    Async(crate::task::JoinHandle<T>),
+}
+
+impl Future for JoinHandleInner<(Operation, Buf)> {
+    type Output = io::Result<(Operation, Buf)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            JoinHandleInner::Blocking(ref mut jh) => Pin::new(jh)
+                .poll(cx)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
+            JoinHandleInner::Async(ref mut jh) => Pin::new(jh)
+                .poll(cx)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -399,7 +420,7 @@ impl File {
 
         let std = self.std.clone();
 
-        inner.state = State::Busy(spawn_blocking(move || {
+        inner.state = State::Busy(JoinHandleInner::Blocking(spawn_blocking(move || {
             let res = if let Some(seek) = seek {
                 (&*std).seek(seek).and_then(|_| std.set_len(size))
             } else {
@@ -409,7 +430,7 @@ impl File {
 
             // Return the result as a seek
             (Operation::Seek(res), buf)
-        }));
+        })));
 
         let (op, buf) = match inner.state {
             State::Idle(_) => unreachable!(),
@@ -613,13 +634,14 @@ impl AsyncRead for File {
                     let std = me.std.clone();
 
                     let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
-                    inner.state = State::Busy(spawn_blocking(move || {
-                        // SAFETY: the `Read` implementation of `std` does not
-                        // read from the buffer it is borrowing and correctly
-                        // reports the length of the data written into the buffer.
-                        let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
-                        (Operation::Read(res), buf)
-                    }));
+                    inner.state =
+                        State::Busy(JoinHandleInner::Blocking(spawn_blocking(move || {
+                            // SAFETY: the `Read` implementation of `std` does not
+                            // read from the buffer it is borrowing and correctly
+                            // reports the length of the data written into the buffer.
+                            let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
+                            (Operation::Read(res), buf)
+                        })));
                 }
                 State::Busy(ref mut rx) => {
                     let (op, mut buf) = ready!(Pin::new(rx).poll(cx))?;
@@ -685,10 +707,10 @@ impl AsyncSeek for File {
 
                 let std = me.std.clone();
 
-                inner.state = State::Busy(spawn_blocking(move || {
+                inner.state = State::Busy(JoinHandleInner::Blocking(spawn_blocking(move || {
                     let res = (&*std).seek(pos);
                     (Operation::Seek(res), buf)
-                }));
+                })));
                 Ok(())
             }
         }
@@ -753,20 +775,68 @@ impl AsyncWrite for File {
                     let n = buf.copy_from(src, me.max_buf_size);
                     let std = me.std.clone();
 
-                    let blocking_task_join_handle = spawn_mandatory_blocking(move || {
-                        let res = if let Some(seek) = seek {
-                            (&*std).seek(seek).and_then(|_| buf.write_to(&mut &*std))
-                        } else {
-                            buf.write_to(&mut &*std)
+                    let task_join_handle;
+
+                    #[cfg(all(
+                        tokio_unstable,
+                        feature = "io-uring",
+                        feature = "rt",
+                        feature = "fs",
+                        target_os = "linux"
+                    ))]
+                    {
+                        task_join_handle = {
+                            use crate::runtime::driver::op::Op;
+
+                            let offset = if let Some(seek) = seek {
+                                (&*std).seek(seek).map_err(|e| {
+                                    io::Error::new(
+                                        e.kind(),
+                                        format!("failed to seek before write: {e}"),
+                                    )
+                                })?
+                            } else {
+                                u64::MAX // -1, uses current cursor
+                            };
+
+                            let op = Op::write_at(std, buf, offset)?;
+
+                            let handle = crate::spawn(async move {
+                                match op.await {
+                                    Ok(n) => (Operation::Write(Ok(())), n.1),
+                                    Err(e) => (Operation::Write(Err(e.0)), e.1.0),
+                                }
+                            });
+
+                            JoinHandleInner::Async(handle)
                         };
+                    }
 
-                        (Operation::Write(res), buf)
-                    })
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "background task failed")
-                    })?;
+                    #[cfg(not(all(
+                        tokio_unstable,
+                        feature = "io-uring",
+                        feature = "rt",
+                        feature = "fs",
+                        target_os = "linux"
+                    )))]
+                    {
+                        let handle = spawn_mandatory_blocking(move || {
+                            let res = if let Some(seek) = seek {
+                                (&*std).seek(seek).and_then(|_| buf.write_to(&mut &*std))
+                            } else {
+                                buf.write_to(&mut &*std)
+                            };
 
-                    inner.state = State::Busy(blocking_task_join_handle);
+                            (Operation::Write(res), buf)
+                        })
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "background task failed")
+                        })?;
+
+                        task_join_handle = JoinHandleInner::Blocking(handle);
+                    }
+
+                    inner.state = State::Busy(task_join_handle);
 
                     return Poll::Ready(Ok(n));
                 }
@@ -837,7 +907,7 @@ impl AsyncWrite for File {
                         io::Error::new(io::ErrorKind::Other, "background task failed")
                     })?;
 
-                    inner.state = State::Busy(blocking_task_join_handle);
+                    inner.state = State::Busy(JoinHandleInner::Blocking(blocking_task_join_handle));
 
                     return Poll::Ready(Ok(n));
                 }

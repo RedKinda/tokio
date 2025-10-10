@@ -245,7 +245,7 @@ mod read;
 pub use self::read::read;
 
 mod read_dir;
-pub use self::read_dir::{read_dir, DirEntry, ReadDir};
+pub use self::read_dir::{DirEntry, ReadDir, read_dir};
 
 mod read_link;
 pub use self::read_link::read_link;
@@ -281,7 +281,7 @@ mod try_exists;
 pub use self::try_exists::try_exists;
 
 #[cfg(test)]
-mod mocks;
+pub(crate) mod mocks;
 
 feature! {
     #![unix]

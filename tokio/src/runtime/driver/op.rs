@@ -72,7 +72,9 @@ impl From<cqueue::Entry> for CqeResult {
 /// A trait that converts a CQE result into a usable value for each operation.
 pub(crate) trait Completable {
     type Output;
-    fn complete(self, cqe: CqeResult) -> io::Result<Self::Output>;
+    type Error;
+    fn complete(self, cqe: CqeResult) -> Result<Self::Output, (io::Error, Self::Error)>;
+    fn error(self) -> Self::Error;
 }
 
 /// Extracts the `CancelData` needed to safely cancel an in-flight io_uring operation.
@@ -86,7 +88,7 @@ pub(crate) trait Cancellable {
 impl<T: Cancellable> Unpin for Op<T> {}
 
 impl<T: Cancellable + Completable + Send> Future for Op<T> {
-    type Output = io::Result<T::Output>;
+    type Output = Result<T::Output, (io::Error, T::Error)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -104,9 +106,18 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                 let driver = handle.inner.driver().io();
 
                 // SAFETY: entry is valid for the entire duration of the operation
-                unsafe { driver.register_op(entry, tx, data)? };
+                unsafe {
+                    driver.register_op(entry, tx, data).map_err(|e| {
+                        // If registration fails, we need to return the data back to the caller
+                        let data = T::from_data(e.1).error();
+                        (e.0, data)
+                    })?
+                };
 
                 this.state = State::Polled(rx);
+
+                // op has been submitted, we drive completions in case it completed immediately
+                let _ = driver.with_uring(|uring| uring.dispatch_completions());
 
                 // immediately poll self again so that rx is polled and a waker is registered
                 pin!(this);
@@ -125,11 +136,11 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                         // The sender was dropped, which means the operation was cancelled.
                         // This shouldnt happen, maybe panic here instead?
                         this.state = State::Complete;
-
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "operation cancelled",
-                        )))
+                        panic!("oneshot sender dropped, operation was cancelled");
+                        // Poll::Ready(Err(io::Error::new(
+                        //     io::ErrorKind::Other,
+                        //     "operation cancelled",
+                        // )))
                     }
                     Poll::Pending => Poll::Pending,
                 }

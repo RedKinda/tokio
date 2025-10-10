@@ -105,8 +105,8 @@ impl UringContext {
         }
     }
 
-    pub(crate) fn remove_op(&mut self, index: usize) {
-        self.ops.remove(index);
+    pub(crate) fn remove_op(&mut self, index: usize) -> (CqeSender, CancelData) {
+        self.ops.remove(index)
     }
 }
 
@@ -221,10 +221,14 @@ impl Handle {
         entry: Entry,
         sender: CqeSender,
         cancel_data: CancelData,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, (io::Error, CancelData)> {
         // Note: Maybe this check can be removed if upstream callers consistently use `check_and_init`.
-        if !self.check_and_init()? {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        let check = self.check_and_init();
+        if let Err(e) = check {
+            return Err((e, cancel_data));
+        }
+        if !check.unwrap() {
+            return Err((io::Error::from_raw_os_error(libc::ENOSYS), cancel_data));
         }
 
         // Uring is initialized.
@@ -233,11 +237,11 @@ impl Handle {
             let index = ctx.ops.insert((sender, cancel_data));
             let entry = entry.user_data(index as u64);
 
-            let submit_or_remove = |ctx: &mut UringContext| -> io::Result<()> {
+            let submit_or_remove = |ctx: &mut UringContext| -> Result<(), (io::Error, CancelData)> {
                 if let Err(e) = ctx.submit() {
                     // Submission failed, remove the entry from the slab and return the error
-                    ctx.remove_op(index);
-                    return Err(e);
+                    let (_, data) = ctx.remove_op(index);
+                    return Err((e, data));
                 }
                 Ok(())
             };

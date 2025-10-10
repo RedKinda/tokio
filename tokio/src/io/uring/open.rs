@@ -16,11 +16,13 @@ pub(crate) struct Open {
 
 impl Completable for Open {
     type Output = crate::fs::File;
-    fn complete(self, cqe: CqeResult) -> io::Result<Self::Output> {
-        let fd = cqe.result? as i32;
+    type Error = ();
+    fn complete(self, cqe: CqeResult) -> Result<Self::Output, (io::Error, Self::Error)> {
+        let fd = cqe.result.map_err(|e| (e, ()))? as i32;
         let file = unsafe { crate::fs::File::from_raw_fd(fd) };
         Ok(file)
     }
+    fn error(self) -> Self::Error {}
 }
 
 impl Cancellable for Open {

@@ -7,7 +7,7 @@ use std::io;
 use std::io::prelude::*;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 /// `T` should not implement _both_ Read and Write.
 #[derive(Debug)]
@@ -232,6 +232,16 @@ impl Buf {
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.buf[self.pos..]
+    }
+
+    pub(crate) fn advance(&mut self, n: usize) {
+        assert!(n <= self.len());
+        self.pos += n;
+
+        if self.pos == self.buf.len() {
+            self.buf.truncate(0);
+            self.pos = 0;
+        }
     }
 
     /// # Safety

@@ -1,4 +1,4 @@
-use crate::fs::{asyncify, File};
+use crate::fs::{File, asyncify};
 
 use std::io;
 use std::path::Path;
@@ -532,7 +532,7 @@ impl OpenOptions {
                 let driver_handle = handle.inner.driver().io();
 
                 if driver_handle.check_and_init()? {
-                    Op::open(path.as_ref(), opts)?.await
+                    Op::open(path.as_ref(), opts)?.await.map_err(|e| e.0)
                 } else {
                     let opts = opts.clone().into();
                     Self::std_open(&opts, path).await
