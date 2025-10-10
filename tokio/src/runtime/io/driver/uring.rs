@@ -2,10 +2,10 @@ use io_uring::{IoUring, squeue::Entry};
 use mio::unix::SourceFd;
 use slab::Slab;
 
+use crate::io::Interest;
 use crate::loom::sync::atomic::Ordering;
 use crate::runtime::driver::op::{CancelData, CqeResult};
 use crate::sync::oneshot;
-use crate::{io::Interest, loom::sync::Mutex};
 
 use super::{Handle, TOKEN_WAKEUP};
 
@@ -14,29 +14,6 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
 const DEFAULT_RING_SIZE: u32 = 256;
-
-#[repr(usize)]
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum State {
-    Uninitialized = 0,
-    Initialized = 1,
-    Unsupported = 2,
-}
-
-impl State {
-    fn as_usize(&self) -> usize {
-        *self as usize
-    }
-
-    fn from_usize(value: usize) -> Self {
-        match value {
-            0 => State::Uninitialized,
-            1 => State::Initialized,
-            2 => State::Unsupported,
-            _ => unreachable!("invalid Uring state: {}", value),
-        }
-    }
-}
 
 pub(crate) type CqeSender = oneshot::Sender<(CqeResult, CancelData)>;
 
@@ -190,13 +167,15 @@ impl Handle {
                     err = Some(e);
                 } else {
                     let fd = ctx.ring().as_raw_fd();
-                    if let Err(e) =
-                        self.uring_fd
-                            .compare_exchange(0, fd, Ordering::Acquire, Ordering::Acquire)
-                    {
+                    if let Err(e) = self.uring_fd.compare_exchange(
+                        0,
+                        fd as u32,
+                        Ordering::Acquire,
+                        Ordering::Acquire,
+                    ) {
                         // Another thread initialized the uring_fd concurrently.
                         // We re-initialize the context with the existing fd.
-                        if let Err(e) = ctx.try_init(Some(e)) {
+                        if let Err(e) = ctx.try_init(Some(e as i32)) {
                             err = Some(e);
                         }
                     }
