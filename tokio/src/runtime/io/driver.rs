@@ -19,6 +19,22 @@ use mio::event::Source;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring",
+    feature = "rt",
+    feature = "fs",
+    target_os = "linux",
+))]
+use std::sync::atomic::AtomicI32;
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring",
+    feature = "rt",
+    feature = "fs",
+    target_os = "linux",
+))]
+use std::sync::atomic::AtomicI64;
 use std::time::Duration;
 
 /// I/O driver, backed by Mio.
@@ -67,7 +83,7 @@ pub(crate) struct Handle {
         feature = "fs",
         target_os = "linux",
     ))]
-    pub(crate) uring_state: AtomicUsize,
+    pub(crate) uring_fd: AtomicI32,
 }
 
 #[derive(Debug)]
@@ -150,7 +166,7 @@ impl Driver {
                 feature = "fs",
                 target_os = "linux",
             ))]
-            uring_state: AtomicUsize::new(0),
+            uring_fd: AtomicI32::new(0), // 0 should be stdin so we can use it as a placeholder for an uninitialized state
         };
 
         Ok((driver, handle))
@@ -230,9 +246,7 @@ impl Driver {
             target_os = "linux",
         ))]
         {
-            let mut guard = handle.get_uring().lock();
-            let ctx = &mut *guard;
-            ctx.dispatch_completions();
+            let _ = handle.with_uring(|ctx| ctx.dispatch_completions());
         }
 
         handle.metrics.incr_ready_count_by(ready_count);

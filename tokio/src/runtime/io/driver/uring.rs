@@ -1,15 +1,17 @@
-use io_uring::{squeue::Entry, IoUring};
+use io_uring::{IoUring, squeue::Entry};
 use mio::unix::SourceFd;
 use slab::Slab;
 
 use crate::loom::sync::atomic::Ordering;
-use crate::runtime::driver::op::{Cancellable, Lifecycle};
+use crate::runtime::driver::op::{CancelData, CqeResult};
+use crate::sync::oneshot;
 use crate::{io::Interest, loom::sync::Mutex};
 
 use super::{Handle, TOKEN_WAKEUP};
 
+use std::cell::{OnceCell, RefCell};
+use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::{io, mem, task::Waker};
 
 const DEFAULT_RING_SIZE: u32 = 256;
 
@@ -36,9 +38,11 @@ impl State {
     }
 }
 
+pub(crate) type CqeSender = oneshot::Sender<(CqeResult, CancelData)>;
+
 pub(crate) struct UringContext {
     pub(crate) uring: Option<io_uring::IoUring>,
-    pub(crate) ops: slab::Slab<Lifecycle>,
+    pub(crate) ops: slab::Slab<(CqeSender, CancelData)>,
 }
 
 impl UringContext {
@@ -62,13 +66,15 @@ impl UringContext {
     ///
     /// If the machine doesn't support io_uring, then this will return an
     /// `ENOSYS` error.
-    pub(crate) fn try_init(&mut self) -> io::Result<bool> {
-        if self.uring.is_some() {
-            // Already initialized.
-            return Ok(false);
+    pub(crate) fn try_init(&mut self, uring_fd: Option<i32>) -> io::Result<bool> {
+        let mut uring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
+
+        if let Some(fd) = uring_fd {
+            // Safety: The fd must be a valid io_uring fd.
+            uring.setup_attach_wq(fd);
         }
 
-        self.uring.replace(IoUring::new(DEFAULT_RING_SIZE)?);
+        self.uring.replace(uring.build(DEFAULT_RING_SIZE)?);
 
         Ok(true)
     }
@@ -80,23 +86,16 @@ impl UringContext {
             return;
         };
 
-        let cq = uring.completion();
+        let mut cq = uring.completion();
+        cq.sync();
 
         for cqe in cq {
             let idx = cqe.user_data() as usize;
 
-            match ops.get_mut(idx) {
-                Some(Lifecycle::Waiting(waker)) => {
-                    waker.wake_by_ref();
-                    *ops.get_mut(idx).unwrap() = Lifecycle::Completed(cqe);
-                }
-                Some(Lifecycle::Cancelled(_)) => {
-                    // Op future was cancelled, so we discard the result.
-                    // We just remove the entry from the slab.
-                    ops.remove(idx);
-                }
-                Some(other) => {
-                    panic!("unexpected lifecycle for slot {idx}: {other:?}");
+            match ops.try_remove(idx) {
+                Some((sender, data)) => {
+                    // It's possible that the receiver has been dropped, so we ignore the error.
+                    let _ = sender.send((CqeResult::from(cqe), data));
                 }
                 None => {
                     panic!("no op at index {idx}");
@@ -129,8 +128,8 @@ impl UringContext {
         }
     }
 
-    pub(crate) fn remove_op(&mut self, index: usize) -> Lifecycle {
-        self.ops.remove(index)
+    pub(crate) fn remove_op(&mut self, index: usize) {
+        self.ops.remove(index);
     }
 }
 
@@ -149,9 +148,6 @@ impl Drop for UringContext {
 
         let mut ops = std::mem::take(&mut self.ops);
 
-        // Remove all completed ops since we don't need to wait for them.
-        ops.retain(|_, lifecycle| !matches!(lifecycle, Lifecycle::Completed(_)));
-
         while !ops.is_empty() {
             // Wait until at least one completion is available.
             self.ring_mut()
@@ -166,6 +162,8 @@ impl Drop for UringContext {
     }
 }
 
+tokio_thread_local!(static URING_CTX: OnceCell<RefCell<UringContext>> = OnceCell::new());
+
 impl Handle {
     fn add_uring_source(&self, uringfd: RawFd) -> io::Result<()> {
         let mut source = SourceFd(&uringfd);
@@ -173,43 +171,60 @@ impl Handle {
             .register(&mut source, TOKEN_WAKEUP, Interest::READABLE.to_mio())
     }
 
-    pub(crate) fn get_uring(&self) -> &Mutex<UringContext> {
-        &self.uring_context
-    }
+    pub(crate) fn with_uring<F, R>(&self, f: F) -> Result<R, io::Error>
+    where
+        F: FnOnce(&mut UringContext) -> R,
+    {
+        URING_CTX.with(|cell| {
+            let mut err = None;
+            let ctx = cell.get_or_init(|| {
+                let mut ctx = UringContext::new();
+                let uring_fd = self.uring_fd.load(Ordering::Acquire);
+                let uring_fd = if uring_fd == 0 {
+                    None
+                } else {
+                    Some(uring_fd as i32)
+                };
 
-    fn set_uring_state(&self, state: State) {
-        self.uring_state.store(state.as_usize(), Ordering::Release);
+                if let Err(e) = ctx.try_init(uring_fd) {
+                    err = Some(e);
+                } else {
+                    let fd = ctx.ring().as_raw_fd();
+                    if let Err(e) =
+                        self.uring_fd
+                            .compare_exchange(0, fd, Ordering::Acquire, Ordering::Acquire)
+                    {
+                        // Another thread initialized the uring_fd concurrently.
+                        // We re-initialize the context with the existing fd.
+                        if let Err(e) = ctx.try_init(Some(e)) {
+                            err = Some(e);
+                        }
+                    }
+                }
+
+                if err.is_none() {
+                    if let Err(e) = self.add_uring_source(ctx.ring().as_raw_fd()) {
+                        err = Some(e);
+                    }
+                }
+
+                RefCell::new(ctx)
+            });
+
+            // TODO make this not panic
+            if let Some(e) = err {
+                return Err(e);
+            }
+
+            Ok(f(&mut ctx.borrow_mut()))
+        })
     }
 
     /// Check if the io_uring context is initialized. If not, it will try to initialize it.
     pub(crate) fn check_and_init(&self) -> io::Result<bool> {
-        match State::from_usize(self.uring_state.load(Ordering::Acquire)) {
-            State::Uninitialized => match self.try_init() {
-                Ok(()) => {
-                    self.set_uring_state(State::Initialized);
-                    Ok(true)
-                }
-                // If the system doesn't support io_uring, we set the state to Unsupported.
-                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
-                    self.set_uring_state(State::Unsupported);
-                    Ok(false)
-                }
-                // For other system errors, we just return it.
-                Err(e) => Err(e),
-            },
-            State::Unsupported => Ok(false),
-            State::Initialized => Ok(true),
-        }
-    }
+        self.with_uring(|ctx| ctx.uring.is_some())?;
 
-    /// Initialize the io_uring context if it hasn't been initialized yet.
-    fn try_init(&self) -> io::Result<()> {
-        let mut guard = self.get_uring().lock();
-        if guard.try_init()? {
-            self.add_uring_source(guard.ring().as_raw_fd())?;
-        }
-
-        Ok(())
+        Ok(true)
     }
 
     /// Register an operation with the io_uring.
@@ -222,7 +237,12 @@ impl Handle {
     ///
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
-    pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> io::Result<usize> {
+    pub(crate) unsafe fn register_op(
+        &self,
+        entry: Entry,
+        sender: CqeSender,
+        cancel_data: CancelData,
+    ) -> io::Result<usize> {
         // Note: Maybe this check can be removed if upstream callers consistently use `check_and_init`.
         if !self.check_and_init()? {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
@@ -230,58 +250,35 @@ impl Handle {
 
         // Uring is initialized.
 
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let index = ctx.ops.insert(Lifecycle::Waiting(waker));
-        let entry = entry.user_data(index as u64);
+        self.with_uring(|ctx| {
+            let index = ctx.ops.insert((sender, cancel_data));
+            let entry = entry.user_data(index as u64);
 
-        let submit_or_remove = |ctx: &mut UringContext| -> io::Result<()> {
-            if let Err(e) = ctx.submit() {
-                // Submission failed, remove the entry from the slab and return the error
-                ctx.remove_op(index);
-                return Err(e);
+            let submit_or_remove = |ctx: &mut UringContext| -> io::Result<()> {
+                if let Err(e) = ctx.submit() {
+                    // Submission failed, remove the entry from the slab and return the error
+                    ctx.remove_op(index);
+                    return Err(e);
+                }
+                Ok(())
+            };
+
+            // SAFETY: entry is valid for the entire duration of the operation
+            while unsafe { ctx.ring_mut().submission().push(&entry).is_err() } {
+                // If the submission queue is full, flush it to the kernel
+                submit_or_remove(ctx)?;
             }
-            Ok(())
-        };
 
-        // SAFETY: entry is valid for the entire duration of the operation
-        while unsafe { ctx.ring_mut().submission().push(&entry).is_err() } {
-            // If the submission queue is full, flush it to the kernel
+            // Ensure that the completion queue is not full before submitting the entry.
+            while ctx.ring_mut().completion().is_full() {
+                ctx.dispatch_completions();
+            }
+
+            // Note: For now, we submit the entry immediately without utilizing batching.
             submit_or_remove(ctx)?;
-        }
 
-        // Ensure that the completion queue is not full before submitting the entry.
-        while ctx.ring_mut().completion().is_full() {
-            ctx.dispatch_completions();
-        }
-
-        // Note: For now, we submit the entry immediately without utilizing batching.
-        submit_or_remove(ctx)?;
-
-        Ok(index)
-    }
-
-    pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let ops = &mut ctx.ops;
-        let Some(lifecycle) = ops.get_mut(index) else {
-            // The corresponding index doesn't exist anymore, so this Op is already complete.
-            return;
-        };
-
-        // This Op will be cancelled. Here, we don't remove the lifecycle from the slab to keep
-        // uring data alive until the operation completes.
-
-        let cancel_data = data.expect("Data should be present").cancel();
-        match mem::replace(lifecycle, Lifecycle::Cancelled(cancel_data)) {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => (),
-            // The driver saw the completion, but it was never polled.
-            Lifecycle::Completed(_) => {
-                // We can safely remove the entry from the slab, as it has already been completed.
-                ops.remove(index);
-            }
-            prev => panic!("Unexpected state: {prev:?}"),
-        };
+            Ok(index)
+        })
+        .expect("uring was checked as initialized")
     }
 }

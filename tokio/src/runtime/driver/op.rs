@@ -1,14 +1,14 @@
 use crate::io::uring::open::Open;
 use crate::io::uring::write::Write;
 use crate::runtime::Handle;
+use crate::sync::oneshot;
 use io_uring::cqueue;
 use io_uring::squeue::Entry;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
-use std::task::Waker;
-use std::{io, mem};
 
 // This field isn't accessed directly, but it holds cancellation data,
 // so `#[allow(dead_code)]` is needed.
@@ -19,29 +19,9 @@ pub(crate) enum CancelData {
     Write(Write),
 }
 
-#[derive(Debug)]
-pub(crate) enum Lifecycle {
-    /// The operation has been submitted to uring and is currently in-flight
-    Submitted,
-
-    /// The submitter is waiting for the completion of the operation
-    Waiting(Waker),
-
-    /// The submitter no longer has interest in the operation result. The state
-    /// must be passed to the driver and held until the operation completes.
-    Cancelled(
-        // This field isn't accessed directly, but it holds cancellation data,
-        // so `#[allow(dead_code)]` is needed.
-        #[allow(dead_code)] CancelData,
-    ),
-
-    /// The operation has completed with a single cqe result
-    Completed(io_uring::cqueue::Entry),
-}
-
 pub(crate) enum State {
     Initialize(Option<Entry>),
-    Polled(usize),
+    Polled(oneshot::Receiver<(CqeResult, CancelData)>),
     Complete,
 }
 
@@ -72,24 +52,6 @@ impl<T: Cancellable> Op<T> {
     }
 }
 
-impl<T: Cancellable> Drop for Op<T> {
-    fn drop(&mut self) {
-        match self.state {
-            // We've already dropped this Op.
-            State::Complete => (),
-            // We will cancel this Op.
-            State::Polled(index) => {
-                let data = self.take_data();
-                let handle = &mut self.handle;
-                handle.inner.driver().io().cancel_op(index, data);
-            }
-            // This Op has not been polled yet.
-            // We don't need to do anything here.
-            State::Initialize(_) => (),
-        }
-    }
-}
-
 /// A single CQE result
 pub(crate) struct CqeResult {
     pub(crate) result: io::Result<u32>,
@@ -115,7 +77,10 @@ pub(crate) trait Completable {
 
 /// Extracts the `CancelData` needed to safely cancel an in-flight io_uring operation.
 pub(crate) trait Cancellable {
-    fn cancel(self) -> CancelData;
+    fn cancel_data(self) -> CancelData;
+    fn from_data(data: CancelData) -> Self
+    where
+        Self: Sized;
 }
 
 impl<T: Cancellable> Unpin for Op<T> {}
@@ -125,57 +90,48 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let handle = &mut this.handle;
-        let driver = handle.inner.driver().io();
 
         match &mut this.state {
             State::Initialize(entry_opt) => {
                 let entry = entry_opt.take().expect("Entry must be present");
-                let waker = cx.waker().clone();
+                let (tx, rx) = oneshot::channel();
+                let data = this
+                    .take_data()
+                    .expect("Data must be some when initializing")
+                    .cancel_data();
+
+                let handle = &mut this.handle;
+                let driver = handle.inner.driver().io();
+
                 // SAFETY: entry is valid for the entire duration of the operation
-                let idx = unsafe { driver.register_op(entry, waker)? };
-                this.state = State::Polled(idx);
-                Poll::Pending
+                unsafe { driver.register_op(entry, tx, data)? };
+
+                this.state = State::Polled(rx);
+
+                // immediately poll self again so that rx is polled and a waker is registered
+                pin!(this);
+                this.poll(cx)
             }
 
-            State::Polled(idx) => {
-                let mut ctx = driver.get_uring().lock();
-                let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
-
-                match mem::replace(lifecycle, Lifecycle::Submitted) {
-                    // Only replace the stored waker if it wouldn't wake the new one
-                    Lifecycle::Waiting(prev) if !prev.will_wake(cx.waker()) => {
-                        let waker = cx.waker().clone();
-                        *lifecycle = Lifecycle::Waiting(waker);
-                        Poll::Pending
+            State::Polled(rx) => {
+                // poll the receiver
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok((cqe, data))) => {
+                        this.state = State::Complete;
+                        let d = T::from_data(data).complete(cqe);
+                        Poll::Ready(d)
                     }
-
-                    Lifecycle::Waiting(prev) => {
-                        *lifecycle = Lifecycle::Waiting(prev);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Completed(cqe) => {
-                        // Clean up and complete the future
-                        ctx.remove_op(*idx);
-
+                    Poll::Ready(Err(_)) => {
+                        // The sender was dropped, which means the operation was cancelled.
+                        // This shouldnt happen, maybe panic here instead?
                         this.state = State::Complete;
 
-                        drop(ctx);
-
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on completion");
-                        Poll::Ready(data.complete(cqe.into()))
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "operation cancelled",
+                        )))
                     }
-
-                    Lifecycle::Submitted => {
-                        unreachable!("Submitted lifecycle should never be seen here");
-                    }
-
-                    Lifecycle::Cancelled(_) => {
-                        unreachable!("Cancelled lifecycle should never be seen here");
-                    }
+                    Poll::Pending => Poll::Pending,
                 }
             }
 

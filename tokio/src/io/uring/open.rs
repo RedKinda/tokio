@@ -24,8 +24,18 @@ impl Completable for Open {
 }
 
 impl Cancellable for Open {
-    fn cancel(self) -> CancelData {
+    fn cancel_data(self) -> CancelData {
         CancelData::Open(self)
+    }
+
+    fn from_data(data: CancelData) -> Self
+    where
+        Self: Sized,
+    {
+        match data {
+            CancelData::Open(open) => open,
+            _ => panic!("unexpected CancelData variant"),
+        }
     }
 }
 

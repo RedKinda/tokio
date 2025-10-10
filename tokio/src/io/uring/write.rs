@@ -22,8 +22,18 @@ impl Completable for Write {
 }
 
 impl Cancellable for Write {
-    fn cancel(self) -> CancelData {
+    fn cancel_data(self) -> CancelData {
         CancelData::Write(self)
+    }
+
+    fn from_data(data: CancelData) -> Self
+    where
+        Self: Sized,
+    {
+        match data {
+            CancelData::Write(write) => write,
+            _ => panic!("unexpected CancelData variant"),
+        }
     }
 }
 
