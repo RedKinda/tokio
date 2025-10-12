@@ -96,7 +96,6 @@ enum Kind {
         tokio_unstable,
         feature = "io-uring",
         feature = "rt",
-        feature = "fs",
         target_os = "linux"
     ))]
     Uring(UringOpenOptions),
@@ -124,7 +123,6 @@ impl OpenOptions {
             tokio_unstable,
             feature = "io-uring",
             feature = "rt",
-            feature = "fs",
             target_os = "linux"
         ))]
         let inner = Kind::Uring(UringOpenOptions::new());
@@ -132,7 +130,6 @@ impl OpenOptions {
             tokio_unstable,
             feature = "io-uring",
             feature = "rt",
-            feature = "fs",
             target_os = "linux"
         )))]
         let inner = Kind::Std(StdOpenOptions::new());
@@ -174,7 +171,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -218,7 +214,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -291,7 +286,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -338,7 +332,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -388,7 +381,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -445,7 +437,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -524,7 +515,6 @@ impl OpenOptions {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux"
             ))]
             Kind::Uring(opts) => {
@@ -593,7 +583,6 @@ feature! {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 ))]
                 Kind::Uring(opts) => {
@@ -638,7 +627,6 @@ feature! {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 ))]
                 Kind::Uring(opts) => {

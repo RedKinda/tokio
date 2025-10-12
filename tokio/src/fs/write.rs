@@ -2,7 +2,6 @@
     tokio_unstable,
     feature = "io-uring",
     feature = "rt",
-    feature = "fs",
     target_os = "linux"
 ))]
 use crate::io::blocking::Buf;
@@ -38,7 +37,6 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Re
         tokio_unstable,
         feature = "io-uring",
         feature = "rt",
-        feature = "fs",
         target_os = "linux"
     ))]
     {
@@ -59,7 +57,6 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Re
     tokio_unstable,
     feature = "io-uring",
     feature = "rt",
-    feature = "fs",
     target_os = "linux"
 ))]
 async fn write_uring(path: &Path, mut buf: Buf) -> io::Result<()> {

@@ -1,6 +1,6 @@
 use crate::loom::sync::{Mutex, MutexGuard};
 use crate::runtime::signal::Handle as SignalHandle;
-use crate::signal::unix::{signal_with_handle, SignalKind};
+use crate::signal::unix::{SignalKind, signal_with_handle};
 use crate::sync::watch;
 use std::io;
 use std::process::ExitStatus;
@@ -295,7 +295,12 @@ pub(crate) mod test {
     #[cfg_attr(miri, ignore)] // Miri does not support epoll.
     #[test]
     fn does_not_register_signal_if_queue_empty() {
-        let (io_driver, io_handle) = IoDriver::new(1024).unwrap();
+        let (io_driver, io_handle) = IoDriver::new(
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+            false,
+            1024,
+        )
+        .unwrap();
         let signal_driver = SignalDriver::new(io_driver, &io_handle).unwrap();
         let handle = signal_driver.handle();
 

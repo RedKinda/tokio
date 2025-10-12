@@ -13,9 +13,7 @@ use std::io::Read as StdRead;
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
-        .enable_io()
-        .enable_time()
-        .worker_threads(2)
+        .enable_all()
         .build()
         .unwrap()
 }
@@ -126,18 +124,26 @@ fn async_write_a_lot(c: &mut Criterion) {
     let rt = rt();
 
     const WRITE_SIZE: usize = 10 * 1024;
+    const WRITE_COUNT: usize = 32;
     let data: &'static mut [u8] = Box::leak(vec![0u8; WRITE_SIZE].into_boxed_slice());
 
     c.bench_function("async_write_a_lot", |b| {
         b.iter(|| {
             let task_inner = || async {
-                let mut file = File::open("/dev/null").await.unwrap();
-                file.write_all(data).await.unwrap();
+                let mut file = File::options()
+                    .append(true)
+                    .open("/dev/null")
+                    .await
+                    .unwrap();
+
+                for i in 0..WRITE_COUNT {
+                    file.write_all(data).await.unwrap();
+                }
             };
 
             let task = || async {
                 let mut tasks = vec![];
-                for _ in 0..1 {
+                for _ in 0..32 {
                     tasks.push(tokio::spawn(async move {
                         task_inner().await;
                     }));

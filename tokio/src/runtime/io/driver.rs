@@ -10,6 +10,7 @@ cfg_io_uring! {
 use crate::io::interest::Interest;
 use crate::io::ready::Ready;
 use crate::loom::sync::Mutex;
+use crate::runtime::context::with_current;
 use crate::runtime::driver;
 use crate::runtime::io::registration_set;
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
@@ -92,6 +93,7 @@ pub(super) enum Tick {
 
 const TOKEN_WAKEUP: mio::Token = mio::Token(0);
 const TOKEN_SIGNAL: mio::Token = mio::Token(1);
+const TOKEN_WAKEUP_ALL: mio::Token = mio::Token(2);
 
 fn _assert_kinds() {
     fn _assert<T: Send + Sync>() {}
@@ -104,7 +106,10 @@ fn _assert_kinds() {
 impl Driver {
     /// Creates a new event loop, returning any error that happened during the
     /// creation.
-    pub(crate) fn new(nevents: usize) -> io::Result<(Driver, Handle)> {
+    pub(crate) fn new(
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))] enabled_uring: bool,
+        nevents: usize,
+    ) -> io::Result<(Driver, Handle)> {
         let poll = mio::Poll::new()?;
         #[cfg(not(target_os = "wasi"))]
         let waker = mio::Waker::new(poll.registry(), TOKEN_WAKEUP)?;
@@ -125,14 +130,12 @@ impl Driver {
             #[cfg(not(target_os = "wasi"))]
             waker,
             metrics: IoDriverMetrics::default(),
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring",
-                feature = "rt",
-                feature = "fs",
-                target_os = "linux",
-            ))]
-            uring_fd: AtomicU32::new(i32::MAX as u32 + 1), // fd is i32, i32::MAX+1 means uninitialized
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+            uring_fd: AtomicU32::new(if enabled_uring {
+                uring::UringState::Uninitialized.as_u32()
+            } else {
+                uring::UringState::Disabled.as_u32()
+            }),
         };
 
         Ok((driver, handle))
@@ -167,6 +170,8 @@ impl Driver {
 
         // Block waiting for an event to happen, peeling out how many events
         // happened.
+        // self.poll.registry().register(source, token, interests)
+
         match self.poll.poll(events, max_wait) {
             Ok(()) => {}
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -187,6 +192,9 @@ impl Driver {
                 // Nothing to do, the event is used to unblock the I/O driver
             } else if token == TOKEN_SIGNAL {
                 self.signal_ready = true;
+            } else if token == TOKEN_WAKEUP_ALL {
+                tracing::trace!("driver turn, wake all");
+                let _ = with_current(|c| c.notify_all());
             } else {
                 let ready = Ready::from_mio(event);
                 let ptr = super::EXPOSE_IO.from_exposed_addr(token.0);
@@ -204,14 +212,9 @@ impl Driver {
             }
         }
 
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux",
-        ))]
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
         {
+            tracing::trace!("driver turn, dispatching uring completions");
             let _ = handle.with_uring(|ctx| ctx.dispatch_completions());
         }
 

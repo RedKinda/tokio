@@ -775,68 +775,67 @@ impl AsyncWrite for File {
                     let n = buf.copy_from(src, me.max_buf_size);
                     let std = me.std.clone();
 
-                    let task_join_handle;
+                    let mut data = Some((std, buf));
 
-                    #[cfg(all(
-                        tokio_unstable,
-                        feature = "io-uring",
-                        feature = "rt",
-                        feature = "fs",
-                        target_os = "linux"
-                    ))]
+                    let mut task_join_handle = None;
+
+                    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
                     {
+                        use crate::runtime::Handle;
+
+                        // Handle not present in some tests?
+                        if let Ok(handle) = Handle::try_current() {
+                            if handle.inner.driver().io().check_and_init()? {
+                                task_join_handle = {
+                                    use crate::runtime::driver::op::Op;
+
+                                    let (std, buf) = data.take().unwrap();
+                                    let offset = if let Some(seek) = seek {
+                                        (&*std).seek(seek).map_err(|e| {
+                                            io::Error::new(
+                                                e.kind(),
+                                                format!("failed to seek before write: {e}"),
+                                            )
+                                        })?
+                                    } else {
+                                        u64::MAX // -1, uses current cursor
+                                    };
+
+                                    let op = Op::write_at(std, buf, offset)?;
+
+                                    let handle = crate::spawn(async move {
+                                        match op.await {
+                                            Ok(n) => (Operation::Write(Ok(())), n.1),
+                                            Err(e) => (Operation::Write(Err(e.0)), e.1.0),
+                                        }
+                                    });
+
+                                    Some(JoinHandleInner::Async(handle))
+                                };
+                            }
+                        }
+                    }
+
+                    if let Some((std, mut buf)) = data {
                         task_join_handle = {
-                            use crate::runtime::driver::op::Op;
+                            let handle = spawn_mandatory_blocking(move || {
+                                let res = if let Some(seek) = seek {
+                                    (&*std).seek(seek).and_then(|_| buf.write_to(&mut &*std))
+                                } else {
+                                    buf.write_to(&mut &*std)
+                                };
 
-                            let offset = if let Some(seek) = seek {
-                                (&*std).seek(seek).map_err(|e| {
-                                    io::Error::new(
-                                        e.kind(),
-                                        format!("failed to seek before write: {e}"),
-                                    )
-                                })?
-                            } else {
-                                u64::MAX // -1, uses current cursor
-                            };
+                                (Operation::Write(res), buf)
+                            })
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::Other, "background task failed")
+                            })?;
 
-                            let op = Op::write_at(std, buf, offset)?;
-
-                            let handle = crate::spawn(async move {
-                                match op.await {
-                                    Ok(n) => (Operation::Write(Ok(())), n.1),
-                                    Err(e) => (Operation::Write(Err(e.0)), e.1.0),
-                                }
-                            });
-
-                            JoinHandleInner::Async(handle)
+                            Some(JoinHandleInner::Blocking(handle))
                         };
                     }
 
-                    #[cfg(not(all(
-                        tokio_unstable,
-                        feature = "io-uring",
-                        feature = "rt",
-                        feature = "fs",
-                        target_os = "linux"
-                    )))]
-                    {
-                        let handle = spawn_mandatory_blocking(move || {
-                            let res = if let Some(seek) = seek {
-                                (&*std).seek(seek).and_then(|_| buf.write_to(&mut &*std))
-                            } else {
-                                buf.write_to(&mut &*std)
-                            };
-
-                            (Operation::Write(res), buf)
-                        })
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::Other, "background task failed")
-                        })?;
-
-                        task_join_handle = JoinHandleInner::Blocking(handle);
-                    }
-
-                    inner.state = State::Busy(task_join_handle);
+                    inner.state = State::Busy(task_join_handle.unwrap());
 
                     return Poll::Ready(Ok(n));
                 }

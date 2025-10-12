@@ -212,7 +212,7 @@ impl Inner {
             PARKED_CONDVAR => self.unpark_condvar(),
             PARKED_DRIVER => driver.unpark(),
             actual => panic!("inconsistent state in unpark; actual = {actual}"),
-        }
+        };
     }
 
     fn unpark_condvar(&self) {

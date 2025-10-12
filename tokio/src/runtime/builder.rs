@@ -1,9 +1,9 @@
 #![cfg_attr(loom, allow(unused_imports))]
 
 use crate::runtime::handle::Handle;
-use crate::runtime::{blocking, driver, Callback, HistogramBuilder, Runtime, TaskCallback};
+use crate::runtime::{Callback, HistogramBuilder, Runtime, TaskCallback, blocking, driver};
 #[cfg(tokio_unstable)]
-use crate::runtime::{metrics::HistogramConfiguration, LocalOptions, LocalRuntime, TaskMeta};
+use crate::runtime::{LocalOptions, LocalRuntime, TaskMeta, metrics::HistogramConfiguration};
 use crate::util::rand::{RngSeed, RngSeedGenerator};
 
 use crate::runtime::blocking::BlockingPool;
@@ -54,6 +54,8 @@ pub struct Builder {
 
     /// Whether or not to enable the I/O driver
     enable_io: bool,
+    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+    enable_io_uring: bool,
     nevents: usize,
 
     /// Whether or not to enable the time driver
@@ -267,6 +269,10 @@ impl Builder {
 
             // I/O defaults to "off"
             enable_io: false,
+
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+            enable_io_uring: false,
+
             nevents: 1024,
 
             // Time defaults to "off"
@@ -348,14 +354,14 @@ impl Builder {
         ))]
         self.enable_io();
 
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux",
-        ))]
-        self.enable_io_uring();
+        // #[cfg(all(
+        //     tokio_unstable,
+        //     feature = "io-uring",
+        //     feature = "rt",
+        //     target_os = "linux",
+        //     any(feature = "fs", feature = "net")
+        // ))]
+        // self.enable_io_uring();
 
         #[cfg(feature = "time")]
         self.enable_time();
@@ -989,6 +995,8 @@ impl Builder {
                 Kind::MultiThread => false,
             },
             enable_io: self.enable_io,
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+            enable_io_uring: self.enable_io_uring,
             enable_time: self.enable_time,
             start_paused: self.start_paused,
             nevents: self.nevents,
@@ -1541,8 +1549,8 @@ impl Builder {
         &mut self,
         local_tid: Option<ThreadId>,
     ) -> io::Result<(CurrentThread, Handle, BlockingPool)> {
-        use crate::runtime::scheduler;
         use crate::runtime::Config;
+        use crate::runtime::scheduler;
 
         let (driver, driver_handle) = driver::Driver::new(self.get_cfg())?;
 
@@ -1673,6 +1681,7 @@ cfg_io_uring! {
         /// Enables the tokio's io_uring driver.
         ///
         /// Doing this enables using io_uring operations on the runtime.
+        /// This also transparently enables the I/O driver.
         ///
         /// # Examples
         ///
@@ -1686,8 +1695,8 @@ cfg_io_uring! {
         /// ```
         #[cfg_attr(docsrs, doc(cfg(feature = "io-uring")))]
         pub fn enable_io_uring(&mut self) -> &mut Self {
-            // Currently, the uring flag is equivalent to `enable_io`.
             self.enable_io = true;
+            self.enable_io_uring = true;
             self
         }
     }

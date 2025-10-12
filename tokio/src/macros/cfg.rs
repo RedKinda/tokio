@@ -145,7 +145,6 @@ macro_rules! cfg_io_driver {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 )
             ))]
@@ -157,7 +156,6 @@ macro_rules! cfg_io_driver {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 )
             ))))]
@@ -177,7 +175,6 @@ macro_rules! cfg_io_driver_impl {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 )
             ))]
@@ -197,7 +194,6 @@ macro_rules! cfg_not_io_driver {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux"
                 )
             )))]
@@ -337,7 +333,6 @@ macro_rules! cfg_net_or_uring {
                     tokio_unstable,
                     feature = "io-uring",
                     feature = "rt",
-                    feature = "fs",
                     target_os = "linux",
                 )
             ))]
@@ -349,7 +344,6 @@ macro_rules! cfg_net_or_uring {
                         tokio_unstable,
                         feature = "io-uring",
                         feature = "rt",
-                        feature = "fs",
                         target_os = "linux",
                     )
                 )))
@@ -704,7 +698,6 @@ macro_rules! cfg_io_uring {
                 tokio_unstable,
                 feature = "io-uring",
                 feature = "rt",
-                feature = "fs",
                 target_os = "linux",
             ))]
             $item

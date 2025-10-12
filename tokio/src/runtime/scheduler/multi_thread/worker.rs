@@ -59,12 +59,12 @@
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
-    idle, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
+    Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker, idle, queue,
 };
-use crate::runtime::scheduler::{inject, Defer, Lock};
+use crate::runtime::scheduler::{Defer, Lock, inject};
 use crate::runtime::task::OwnedTasks;
-use crate::runtime::{blocking, driver, scheduler, task, Config, SchedulerMetrics, WorkerMetrics};
-use crate::runtime::{context, TaskHooks};
+use crate::runtime::{Config, SchedulerMetrics, WorkerMetrics, blocking, driver, scheduler, task};
+use crate::runtime::{TaskHooks, context};
 use crate::task::coop;
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::{FastRand, RngSeedGenerator};
@@ -728,6 +728,15 @@ impl Context {
             f();
         }
 
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+        let _ = self
+            .worker
+            .handle
+            .driver
+            .io
+            .as_ref()
+            .map(|io| io.with_uring(|u| u.dispatch_completions()));
+
         if core.transition_to_parked(&self.worker) {
             while !core.is_shutdown && !core.is_traced {
                 core.stats.about_to_park();
@@ -762,12 +771,16 @@ impl Context {
         // Store `core` in context
         *self.core.borrow_mut() = Some(core);
 
+        tracing::trace!("worker parking");
+
         // Park thread
         if let Some(timeout) = duration {
             park.park_timeout(&self.worker.handle.driver, timeout);
         } else {
             park.park(&self.worker.handle.driver);
         }
+
+        tracing::trace!("worker unparked");
 
         self.defer.wake();
 
@@ -1001,6 +1014,14 @@ impl Core {
             // Check if the worker should be tracing.
             self.is_traced = worker.handle.shared.trace_status.trace_requested();
         }
+
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+        let _ = worker
+            .handle
+            .driver
+            .io
+            .as_ref()
+            .map(|io| io.with_uring(|u| u.dispatch_completions()));
     }
 
     /// Signals all tasks to shut down, and waits for them to complete. Must run
@@ -1156,7 +1177,7 @@ impl Handle {
         }
     }
 
-    pub(super) fn notify_all(&self) {
+    pub(crate) fn notify_all(&self) {
         for remote in &self.shared.remotes[..] {
             remote.unpark.unpark(&self.driver);
         }

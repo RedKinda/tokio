@@ -1,20 +1,20 @@
-use crate::loom::sync::atomic::AtomicBool;
 use crate::loom::sync::Arc;
+use crate::loom::sync::atomic::AtomicBool;
 use crate::runtime::driver::{self, Driver};
 use crate::runtime::scheduler::{self, Defer, Inject};
 use crate::runtime::task::{
     self, JoinHandle, OwnedTasks, Schedule, SpawnLocation, Task, TaskHarnessScheduleHooks,
 };
 use crate::runtime::{
-    blocking, context, Config, MetricsBatch, SchedulerMetrics, TaskHooks, TaskMeta, WorkerMetrics,
+    Config, MetricsBatch, SchedulerMetrics, TaskHooks, TaskMeta, WorkerMetrics, blocking, context,
 };
 use crate::sync::notify::Notify;
 use crate::util::atomic_cell::AtomicCell;
-use crate::util::{waker_ref, RngSeedGenerator, Wake, WakerRef};
+use crate::util::{RngSeedGenerator, Wake, WakerRef, waker_ref};
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::sync::atomic::Ordering::{AcqRel, Release};
 use std::task::Poll::{Pending, Ready};
 use std::task::Waker;
@@ -380,9 +380,27 @@ impl Context {
             core = c;
         }
 
+        #[allow(unused_mut, unused_assignments)]
+        let mut completions_dispatched = false;
+
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+        {
+            let (c, completions_dispatched_inner) = self.enter(core, || {
+                handle
+                    .driver
+                    .io
+                    .as_ref()
+                    .map(|io| io.with_uring(|u| u.dispatch_completions() > 0))
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(false)
+            });
+            core = c;
+            completions_dispatched = completions_dispatched_inner;
+        }
+
         // This check will fail if `before_park` spawns a task for us to run
         // instead of parking the thread
-        if core.tasks.is_empty() {
+        if core.tasks.is_empty() && !completions_dispatched {
             // Park until the thread is signaled
             core.metrics.about_to_park();
             core.submit_metrics(handle);
@@ -809,7 +827,9 @@ impl CoreGuard<'_> {
             Some(ret) => ret,
             None => {
                 // `block_on` panicked.
-                panic!("a spawned task panicked and the runtime is configured to shut down on unhandled panic");
+                panic!(
+                    "a spawned task panicked and the runtime is configured to shut down on unhandled panic"
+                );
             }
         }
     }

@@ -9,29 +9,43 @@
 ))]
 
 use futures::future::FutureExt;
+use std::future::Future;
+use std::io::SeekFrom;
 use std::sync::mpsc;
 use std::task::Poll;
 use std::time::Duration;
 use std::{future::poll_fn, path::PathBuf};
 use tempfile::NamedTempFile;
+use tokio::fs;
+use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::{
     fs::OpenOptions,
     runtime::{Builder, Runtime},
 };
+use tokio_test::assert_ok;
 use tokio_util::task::TaskTracker;
 
 fn multi_rt(n: usize) -> Box<dyn Fn() -> Runtime> {
     Box::new(move || {
+        tracing::trace!("building multi-threaded rt with {n} threads");
         Builder::new_multi_thread()
             .worker_threads(n)
             .enable_all()
+            .enable_io_uring()
             .build()
             .unwrap()
     })
 }
 
 fn current_rt() -> Box<dyn Fn() -> Runtime> {
-    Box::new(|| Builder::new_current_thread().enable_all().build().unwrap())
+    Box::new(|| {
+        tracing::trace!("building current-thread rt");
+        Builder::new_current_thread()
+            .enable_all()
+            .enable_io_uring()
+            .build()
+            .unwrap()
+    })
 }
 
 fn rt_combinations() -> Vec<Box<dyn Fn() -> Runtime>> {
@@ -145,6 +159,148 @@ async fn cancel_op_future() {
     assert!(res.is_cancelled());
 }
 
+#[test]
+fn path_read_write_uring() {
+    // trace level logging is useful for debugging
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_ansi(false)
+        .init();
+
+    fn run(rt: Runtime) {
+        rt.block_on(async move {
+            assert_ok!(fs::write(&create_tmp_files(1).1[0], b"bytes").await);
+        });
+    }
+
+    for rt in rt_combinations().iter().skip(4) {
+        run(rt());
+    }
+}
+
+#[test]
+fn path_write_concurrent() {
+    fn run(rt: Runtime) {
+        rt.block_on(async move {
+            // spawn 1024 tasks that write to separate files
+            let temp = tempdir();
+            let dir = temp.path();
+
+            const NUM_TASKS: usize = 4;
+            const NUM_FILES_PER_TASK: usize = 4;
+
+            let mut handles = Vec::with_capacity(NUM_TASKS);
+            for i in 0..NUM_TASKS {
+                let path = dir.join(format!("file-{}", i));
+                handles.push(tokio::spawn(async move {
+                    for j in 0..NUM_FILES_PER_TASK {
+                        let file_path = path.with_file_name(format!("file-{}-{}", i, j));
+                        assert_ok!(fs::write(&file_path, b"bytes").await);
+                        // sleep i ms
+                        tokio::time::sleep(std::time::Duration::from_millis(i as u64)).await;
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            // verify that all files were written
+            for i in 0..NUM_TASKS {
+                for j in 0..NUM_FILES_PER_TASK {
+                    let file_path = dir.join(format!("file-{}-{}", i, j));
+                    let out = assert_ok!(fs::read(&file_path).await);
+                    assert_eq!(out, b"bytes");
+                }
+            }
+        });
+    }
+
+    for rt in rt_combinations() {
+        run(rt());
+    }
+}
+
+#[test]
+fn path_write_massive() {
+    fn run(rt: Runtime) {
+        rt.block_on(async move {
+            // write a 2.5gb file - this is bigger than a single write uring can handle
+            let path = &create_tmp_files(1).1[0];
+
+            const SIZE: usize = 2_500_000_000;
+            let data = vec![1u8; SIZE];
+            assert_ok!(fs::write(path, &data).await);
+            drop(data);
+
+            let out = assert_ok!(fs::read(path).await);
+            assert_eq!(out.len(), SIZE);
+        });
+    }
+
+    for rt in rt_combinations() {
+        run(rt());
+    }
+}
+
+#[test]
+fn test_async_write() {
+    fn run(rt: Runtime) {
+        rt.block_on(async move {
+            let path = &create_tmp_files(1).1[0];
+
+            let mut file = assert_ok!(fs::File::create(path).await);
+
+            assert_ok!(file.write_all(b"hello world").await);
+
+            // write some more
+            assert_ok!(file.write_all(b"!!!").await);
+
+            assert_ok!(file.flush().await);
+
+            let out = assert_ok!(fs::read(path).await);
+            assert_eq!(out, b"hello world!!!");
+
+            file.seek(SeekFrom::Start(0)).await.unwrap();
+            file.write_all(b"meow!").await.unwrap();
+            file.flush().await.unwrap();
+
+            let out = assert_ok!(fs::read(path).await);
+            assert_eq!(out, b"meow! world!!!");
+        });
+    }
+
+    for rt in rt_combinations() {
+        run(rt());
+    }
+}
+
+#[test]
+fn test_cancelled_write() {
+    fn run(rt: Runtime) {
+        rt.block_on(async move {
+            let path = &create_tmp_files(1).1[0];
+
+            let mut file = assert_ok!(fs::File::create(path).await);
+
+            let mut write_fut = Box::pin(file.write(b"hello world!!!"));
+            poll_fn(move |cx| {
+                assert!(write_fut.as_mut().poll(cx).is_ready());
+
+                Poll::Ready(())
+            })
+            .await;
+        });
+    }
+
+    for rt in rt_combinations() {
+        run(rt());
+    }
+}
+
 fn create_tmp_files(num_files: usize) -> (Vec<NamedTempFile>, Vec<PathBuf>) {
     let mut files = Vec::with_capacity(num_files);
     for _ in 0..num_files {
@@ -154,4 +310,8 @@ fn create_tmp_files(num_files: usize) -> (Vec<NamedTempFile>, Vec<PathBuf>) {
     }
 
     files.into_iter().unzip()
+}
+
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
 }

@@ -7,7 +7,7 @@ use crate::loom::sync::atomic::Ordering;
 use crate::runtime::driver::op::{CancelData, CqeResult};
 use crate::sync::oneshot;
 
-use super::{Handle, TOKEN_WAKEUP};
+use super::{Handle, TOKEN_WAKEUP_ALL};
 
 use std::cell::{OnceCell, RefCell};
 use std::io;
@@ -20,6 +20,33 @@ pub(crate) type CqeSender = oneshot::Sender<(CqeResult, CancelData)>;
 pub(crate) struct UringContext {
     pub(crate) uring: Option<io_uring::IoUring>,
     pub(crate) ops: slab::Slab<(CqeSender, CancelData)>,
+}
+
+pub(crate) enum UringState {
+    Initialized(i32),
+    Uninitialized,
+    Unsupported,
+    Disabled,
+}
+
+impl UringState {
+    pub(crate) fn from_u32(value: u32) -> Self {
+        match value {
+            i if i == i32::MAX as u32 + 1 => UringState::Uninitialized,
+            i if i == i32::MAX as u32 + 2 => UringState::Unsupported,
+            i if i == i32::MAX as u32 + 3 => UringState::Disabled,
+            fd => UringState::Initialized(fd as i32),
+        }
+    }
+
+    pub(crate) fn as_u32(&self) -> u32 {
+        match self {
+            UringState::Initialized(fd) => *fd as u32,
+            UringState::Uninitialized => i32::MAX as u32 + 1,
+            UringState::Unsupported => i32::MAX as u32 + 2,
+            UringState::Disabled => i32::MAX as u32 + 3,
+        }
+    }
 }
 
 impl UringContext {
@@ -53,20 +80,24 @@ impl UringContext {
 
         self.uring.replace(uring.build(DEFAULT_RING_SIZE)?);
 
+        tracing::trace!("io_uring initialized with fd {}", self.ring().as_raw_fd());
         Ok(true)
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) -> usize {
         let ops = &mut self.ops;
         let Some(mut uring) = self.uring.take() else {
             // Uring is not initialized yet.
-            return;
+            return 0;
         };
 
         let mut cq = uring.completion();
         cq.sync();
 
+        let mut dispatched = 0;
+
         for cqe in cq {
+            dispatched += 1;
             let idx = cqe.user_data() as usize;
 
             match ops.try_remove(idx) {
@@ -80,7 +111,13 @@ impl UringContext {
             }
         }
 
+        if dispatched > 0 {
+            tracing::trace!("dispatched {} completions", dispatched);
+        }
+        
         self.uring.replace(uring);
+
+        dispatched
 
         // `cq`'s drop gets called here, updating the latest head pointer
     }
@@ -144,8 +181,9 @@ tokio_thread_local!(static URING_CTX: OnceCell<RefCell<UringContext>> = OnceCell
 impl Handle {
     fn add_uring_source(&self, uringfd: RawFd) -> io::Result<()> {
         let mut source = SourceFd(&uringfd);
+        tracing::trace!("registering uring fd {uringfd} with mio");
         self.registry
-            .register(&mut source, TOKEN_WAKEUP, Interest::READABLE.to_mio())
+            .register(&mut source, TOKEN_WAKEUP_ALL, Interest::READABLE.to_mio())
     }
 
     pub(crate) fn with_uring<F, R>(&self, f: F) -> Result<R, io::Error>
@@ -154,44 +192,72 @@ impl Handle {
     {
         URING_CTX.with(|cell| {
             let mut err = None;
+
             let ctx = cell.get_or_init(|| {
                 let mut ctx = UringContext::new();
-                let uring_fd = self.uring_fd.load(Ordering::Acquire);
-                let uring_fd = if uring_fd == i32::MAX as u32 + 1 {
-                    None
-                } else {
-                    Some(uring_fd as i32)
-                };
+                let uring_state = UringState::from_u32(self.uring_fd.load(Ordering::Acquire));
 
-                if let Err(e) = ctx.try_init(uring_fd) {
-                    err = Some(e);
-                } else {
-                    let fd = ctx.ring().as_raw_fd();
-                    if let Err(e) = self.uring_fd.compare_exchange(
-                        i32::MAX as u32 + 1,
-                        fd as u32,
-                        Ordering::Acquire,
-                        Ordering::Acquire,
-                    ) {
-                        // Another thread initialized the uring_fd concurrently.
-                        // We re-initialize the context with the existing fd.
-                        if let Err(e) = ctx.try_init(Some(e as i32)) {
+                if matches!(
+                    uring_state,
+                    UringState::Uninitialized | UringState::Initialized(_)
+                ) {
+                    let uring_fd = match uring_state {
+                        UringState::Initialized(fd) => Some(fd),
+                        _ => None,
+                    };
+
+                    if let Err(e) = ctx.try_init(uring_fd) {
+                        if matches!(uring_state, UringState::Initialized(_)) {
+                            // failed to initialize uring on this worker thread, after it was successful on another
+                            panic!(
+                                "io_uring was initialized on another thread, but failed to initialize on this thread: {err:?}"
+                            );
+                        }
+
+                        // If the error is ENOSYS, then the kernel doesn't support io_uring.
+                        if e.raw_os_error() == Some(libc::ENOSYS) {
+                            self.uring_fd
+                                .store(UringState::Unsupported.as_u32(), Ordering::Relaxed);
+                            // we dont propagate this error
+                        } else {
                             err = Some(e);
                         }
+                    } else {
+                        let fd = ctx.ring().as_raw_fd();
+                        if let Err(e) = self.uring_fd.compare_exchange(
+                            uring_state.as_u32(),
+                            UringState::Initialized(fd).as_u32(),
+                            Ordering::Acquire,
+                            Ordering::Acquire,
+                        ) {
+                            
+                            let new_state = UringState::from_u32(e);
+                            if let UringState::Initialized(fd) = new_state {
+                                if let Err(e) = ctx.try_init(Some(fd)) {
+                                    err = Some(e);
+                                }
+                            } else {
+                                // this means that this thread was successful in initializing the uring,
+                                // but a different thread received ENOSYS in the meantime.
+                                unreachable!(
+                                    "first uring initialize succeeded, but a concurrent one was unsupported"
+                                )
+                            }
+                        }
                     }
-                }
 
-                if err.is_none() {
-                    if let Err(e) = self.add_uring_source(ctx.ring().as_raw_fd()) {
-                        err = Some(e);
+                    if err.is_none() {
+                        if let Err(e) = self.add_uring_source(ctx.ring().as_raw_fd()) {
+                            err = Some(e);
+                        }
                     }
                 }
 
                 RefCell::new(ctx)
             });
 
-            // TODO make this not panic
             if let Some(e) = err {
+                tracing::trace!("uring initialization failed: {e:?}");
                 return Err(e);
             }
 
@@ -199,11 +265,31 @@ impl Handle {
         })
     }
 
-    /// Check if the io_uring context is initialized. If not, it will try to initialize it.
+    /// Check if the io_uring context is available. If uninitialized, it will try to initialize it.
     pub(crate) fn check_and_init(&self) -> io::Result<bool> {
-        self.with_uring(|ctx| ctx.uring.is_some())?;
+        // self.with_uring(|ctx| ctx.uring.is_some())?;
 
-        Ok(true)
+        let uring_state = UringState::from_u32(self.uring_fd.load(Ordering::Acquire));
+
+        match uring_state {
+            UringState::Initialized(_) => {
+                // Already initialized.
+                Ok(true)
+            }
+            UringState::Unsupported => {
+                // Not supported on this machine.
+                Ok(false)
+            }
+            UringState::Disabled => {
+                // Disabled manually.
+                Ok(false)
+            }
+            UringState::Uninitialized => {
+                // Try to initialize, then check again.
+                self.with_uring(|_| {})?;
+                self.check_and_init()
+            }
+        }
     }
 
     /// Register an operation with the io_uring.
@@ -232,6 +318,8 @@ impl Handle {
         }
 
         // Uring is initialized.
+
+        tracing::trace!("registering uring op {:?}", &entry);
 
         self.with_uring(|ctx| {
             let index = ctx.ops.insert((sender, cancel_data));
