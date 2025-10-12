@@ -113,6 +113,7 @@ enum State {
 #[derive(Debug)]
 enum JoinHandleInner<T> {
     Blocking(JoinHandle<T>),
+    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
     Async(crate::task::JoinHandle<T>),
 }
 
@@ -124,6 +125,7 @@ impl Future for JoinHandleInner<(Operation, Buf)> {
             JoinHandleInner::Blocking(ref mut jh) => Pin::new(jh)
                 .poll(cx)
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
             JoinHandleInner::Async(ref mut jh) => Pin::new(jh)
                 .poll(cx)
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
@@ -775,6 +777,7 @@ impl AsyncWrite for File {
                     let n = buf.copy_from(src, me.max_buf_size);
                     let std = me.std.clone();
 
+                    #[allow(unused_mut)]
                     let mut data = Some((std, buf));
 
                     let mut task_join_handle = None;

@@ -12,10 +12,12 @@ use std::fs::File as StdFile;
 use std::io::Read as StdRead;
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+    let mut r = tokio::runtime::Builder::new_multi_thread();
+
+    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
+    let r = r.enable_io_uring();
+
+    r.enable_all().build().unwrap()
 }
 
 const BLOCK_COUNT: usize = 1_000;

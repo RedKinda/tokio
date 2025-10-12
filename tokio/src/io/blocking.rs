@@ -234,6 +234,7 @@ impl Buf {
         &self.buf[self.pos..]
     }
 
+    #[allow(dead_code)]
     pub(crate) fn advance(&mut self, n: usize) {
         assert!(n <= self.len());
         self.pos += n;

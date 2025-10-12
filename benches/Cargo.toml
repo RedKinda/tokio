@@ -6,7 +6,9 @@ edition = "2021"
 license = "MIT"
 
 [features]
+default = ["io-uring"]
 test-util = ["tokio/test-util"]
+io-uring = ["tokio/io-uring"]
 
 [dependencies]
 tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }

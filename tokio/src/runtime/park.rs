@@ -2,7 +2,6 @@
 
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::{Arc, Condvar, Mutex};
-use crate::runtime::context::with_current;
 use crate::util::{Wake, waker};
 
 use std::sync::atomic::Ordering::SeqCst;
@@ -287,19 +286,25 @@ impl CachedParkThread {
                 return Ok(v);
             }
 
-            let completions_dispatched = with_current(|c| {
-                c.driver()
-                    .io
-                    .as_ref()
-                    .map(|io| io.with_uring(|u| u.dispatch_completions() > 0))
-                    .unwrap_or(Ok(false))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
+            {
+                use crate::runtime::context::with_current;
+                let completions_dispatched = with_current(|c| {
+                    c.driver()
+                        .io
+                        .as_ref()
+                        .map(|io| io.with_uring(|u| u.dispatch_completions() > 0))
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
 
-            if !completions_dispatched {
-                self.park();
+                if completions_dispatched {
+                    continue;
+                }
             }
+
+            self.park();
         }
     }
 }
