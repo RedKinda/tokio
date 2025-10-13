@@ -22,31 +22,12 @@ pub(crate) struct UringContext {
     pub(crate) ops: slab::Slab<(CqeSender, CancelData)>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum UringState {
     Initialized(i32),
     Uninitialized,
     Unsupported,
     Disabled,
-}
-
-impl UringState {
-    pub(crate) fn from_u32(value: u32) -> Self {
-        match value {
-            i if i == i32::MAX as u32 + 1 => UringState::Uninitialized,
-            i if i == i32::MAX as u32 + 2 => UringState::Unsupported,
-            i if i == i32::MAX as u32 + 3 => UringState::Disabled,
-            fd => UringState::Initialized(fd as i32),
-        }
-    }
-
-    pub(crate) fn as_u32(&self) -> u32 {
-        match self {
-            UringState::Initialized(fd) => *fd as u32,
-            UringState::Uninitialized => i32::MAX as u32 + 1,
-            UringState::Unsupported => i32::MAX as u32 + 2,
-            UringState::Disabled => i32::MAX as u32 + 3,
-        }
-    }
 }
 
 impl UringContext {
@@ -70,18 +51,44 @@ impl UringContext {
     ///
     /// If the machine doesn't support io_uring, then this will return an
     /// `ENOSYS` error.
-    pub(crate) fn try_init(&mut self, uring_fd: Option<i32>) -> io::Result<bool> {
-        let mut uring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
+    pub(crate) fn try_init(&mut self, uring_wq_fd: Option<i32>) -> io::Result<i32> {
+        let builder = |uring_wq_fd: Option<i32>| {
+            let mut uring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
 
-        if let Some(fd) = uring_fd {
-            // Safety: The fd must be a valid io_uring fd.
-            uring.setup_attach_wq(fd);
+            if let Some(fd) = uring_wq_fd {
+                // Safety: The fd must be a valid io_uring fd.
+                uring.setup_attach_wq(fd);
+            }
+
+            uring.build(DEFAULT_RING_SIZE)
+        };
+
+        let uring = match builder(uring_wq_fd) {
+            Ok(uring) => uring,
+            Err(e) => {
+                // code 6
+                if e.raw_os_error() == Some(6) {
+                    builder(None)?
+                } else {
+                    Err(e)?
+                }
+            }
+        };
+
+        if let Some(previous) = self.uring.replace(uring) {
+            panic!(
+                "io_uring was already initialized, fd {}",
+                previous.as_raw_fd()
+            );
         }
 
-        self.uring.replace(uring.build(DEFAULT_RING_SIZE)?);
+        tracing::trace!(
+            "io_uring initialized with fd {} - WQ {:?}",
+            self.ring().as_raw_fd(),
+            uring_wq_fd
+        );
 
-        tracing::trace!("io_uring initialized with fd {}", self.ring().as_raw_fd());
-        Ok(true)
+        Ok(self.ring().as_raw_fd())
     }
 
     pub(crate) fn dispatch_completions(&mut self) -> usize {
@@ -114,7 +121,7 @@ impl UringContext {
         if dispatched > 0 {
             tracing::trace!("dispatched {} completions", dispatched);
         }
-        
+
         self.uring.replace(uring);
 
         dispatched
@@ -195,53 +202,39 @@ impl Handle {
 
             let ctx = cell.get_or_init(|| {
                 let mut ctx = UringContext::new();
-                let uring_state = UringState::from_u32(self.uring_fd.load(Ordering::Acquire));
+                let mut uring_state = self.uring_fd.lock();
 
                 if matches!(
-                    uring_state,
+                    *uring_state,
                     UringState::Uninitialized | UringState::Initialized(_)
                 ) {
-                    let uring_fd = match uring_state {
+                    let uring_wq_fd = match *uring_state {
                         UringState::Initialized(fd) => Some(fd),
                         _ => None,
                     };
 
-                    if let Err(e) = ctx.try_init(uring_fd) {
-                        if matches!(uring_state, UringState::Initialized(_)) {
-                            // failed to initialize uring on this worker thread, after it was successful on another
-                            panic!(
-                                "io_uring was initialized on another thread, but failed to initialize on this thread: {err:?}"
-                            );
-                        }
+                    match ctx.try_init(uring_wq_fd) {
+                        Err(e) => {
+                            if let UringState::Initialized(other_fd) = *uring_state {
+                                // failed to initialize uring on this worker thread, after it was successful on another
+                                tracing::trace!("guh!!!");
+                                panic!(
+                                    "io_uring was initialized on another thread, but failed to initialize on this thread: {e:?} - other thread initialized on fd {other_fd:?}"
+                                );
+                            }
 
-                        // If the error is ENOSYS, then the kernel doesn't support io_uring.
-                        if e.raw_os_error() == Some(libc::ENOSYS) {
-                            self.uring_fd
-                                .store(UringState::Unsupported.as_u32(), Ordering::Relaxed);
-                            // we dont propagate this error
-                        } else {
-                            err = Some(e);
-                        }
-                    } else {
-                        let fd = ctx.ring().as_raw_fd();
-                        if let Err(e) = self.uring_fd.compare_exchange(
-                            uring_state.as_u32(),
-                            UringState::Initialized(fd).as_u32(),
-                            Ordering::Acquire,
-                            Ordering::Acquire,
-                        ) {
-                            
-                            let new_state = UringState::from_u32(e);
-                            if let UringState::Initialized(fd) = new_state {
-                                if let Err(e) = ctx.try_init(Some(fd)) {
-                                    err = Some(e);
-                                }
+                            // If the error is ENOSYS, then the kernel doesn't support io_uring.
+                            if e.raw_os_error() == Some(libc::ENOSYS) {
+                                *uring_state = UringState::Unsupported;
+                                // we dont propagate this error
                             } else {
-                                // this means that this thread was successful in initializing the uring,
-                                // but a different thread received ENOSYS in the meantime.
-                                unreachable!(
-                                    "first uring initialize succeeded, but a concurrent one was unsupported"
-                                )
+                                err = Some(e);
+                            }
+                        }
+                        Ok(val) => {
+                            if uring_wq_fd != Some(val) {
+                                let fd = ctx.ring().as_raw_fd();
+                                *uring_state = UringState::Initialized(fd);
                             }
                         }
                     }
@@ -269,7 +262,7 @@ impl Handle {
     pub(crate) fn check_and_init(&self) -> io::Result<bool> {
         // self.with_uring(|ctx| ctx.uring.is_some())?;
 
-        let uring_state = UringState::from_u32(self.uring_fd.load(Ordering::Acquire));
+        let uring_state = self.uring_fd.lock().clone();
 
         match uring_state {
             UringState::Initialized(_) => {

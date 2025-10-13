@@ -12,6 +12,14 @@ use crate::io::ready::Ready;
 use crate::loom::sync::Mutex;
 use crate::runtime::context::with_current;
 use crate::runtime::driver;
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring",
+    feature = "rt",
+    feature = "fs",
+    target_os = "linux",
+))]
+use crate::runtime::io::driver::uring::UringState;
 use crate::runtime::io::registration_set;
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
@@ -58,7 +66,7 @@ pub(crate) struct Handle {
         feature = "fs",
         target_os = "linux",
     ))]
-    pub(crate) uring_fd: AtomicU32,
+    pub(crate) uring_fd: Mutex<UringState>,
 }
 
 #[derive(Debug)]
@@ -131,10 +139,10 @@ impl Driver {
             waker,
             metrics: IoDriverMetrics::default(),
             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-            uring_fd: AtomicU32::new(if enabled_uring {
-                uring::UringState::Uninitialized.as_u32()
+            uring_fd: Mutex::new(if enabled_uring {
+                uring::UringState::Uninitialized
             } else {
-                uring::UringState::Disabled.as_u32()
+                uring::UringState::Disabled
             }),
         };
 

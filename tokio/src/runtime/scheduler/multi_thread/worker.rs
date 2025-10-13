@@ -771,7 +771,7 @@ impl Context {
         // Store `core` in context
         *self.core.borrow_mut() = Some(core);
 
-        tracing::trace!("worker parking");
+        // tracing::trace!("worker parking");
 
         // Park thread
         if let Some(timeout) = duration {
@@ -780,7 +780,7 @@ impl Context {
             park.park(&self.worker.handle.driver);
         }
 
-        tracing::trace!("worker unparked");
+        // tracing::trace!("worker unparked");
 
         self.defer.wake();
 
