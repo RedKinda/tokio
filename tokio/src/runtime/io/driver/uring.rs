@@ -3,7 +3,6 @@ use mio::unix::SourceFd;
 use slab::Slab;
 
 use crate::io::Interest;
-use crate::loom::sync::atomic::Ordering;
 use crate::runtime::driver::op::{CancelData, CqeResult};
 use crate::sync::oneshot;
 
@@ -82,6 +81,7 @@ impl UringContext {
             );
         }
 
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         tracing::trace!(
             "io_uring initialized with fd {} - WQ {:?}",
             self.ring().as_raw_fd(),
@@ -118,6 +118,7 @@ impl UringContext {
             }
         }
 
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         if dispatched > 0 {
             tracing::trace!("dispatched {} completions", dispatched);
         }
@@ -188,6 +189,7 @@ tokio_thread_local!(static URING_CTX: OnceCell<RefCell<UringContext>> = OnceCell
 impl Handle {
     fn add_uring_source(&self, uringfd: RawFd) -> io::Result<()> {
         let mut source = SourceFd(&uringfd);
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         tracing::trace!("registering uring fd {uringfd} with mio");
         self.registry
             .register(&mut source, TOKEN_WAKEUP_ALL, Interest::READABLE.to_mio())
@@ -217,7 +219,6 @@ impl Handle {
                         Err(e) => {
                             if let UringState::Initialized(other_fd) = *uring_state {
                                 // failed to initialize uring on this worker thread, after it was successful on another
-                                tracing::trace!("guh!!!");
                                 panic!(
                                     "io_uring was initialized on another thread, but failed to initialize on this thread: {e:?} - other thread initialized on fd {other_fd:?}"
                                 );
@@ -250,6 +251,7 @@ impl Handle {
             });
 
             if let Some(e) = err {
+                #[cfg(all(tokio_unstable, feature = "tracing"))]
                 tracing::trace!("uring initialization failed: {e:?}");
                 return Err(e);
             }
@@ -312,6 +314,7 @@ impl Handle {
 
         // Uring is initialized.
 
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         tracing::trace!("registering uring op {:?}", &entry);
 
         self.with_uring(|ctx| {

@@ -4,7 +4,7 @@ cfg_signal_internal_and_unix! {
 }
 cfg_io_uring! {
     mod uring;
-    use crate::loom::sync::atomic::AtomicU32;
+    use crate::runtime::io::driver::uring::UringState;
 }
 
 use crate::io::interest::Interest;
@@ -12,14 +12,6 @@ use crate::io::ready::Ready;
 use crate::loom::sync::Mutex;
 use crate::runtime::context::with_current;
 use crate::runtime::driver;
-#[cfg(all(
-    tokio_unstable,
-    feature = "io-uring",
-    feature = "rt",
-    feature = "fs",
-    target_os = "linux",
-))]
-use crate::runtime::io::driver::uring::UringState;
 use crate::runtime::io::registration_set;
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
@@ -59,13 +51,7 @@ pub(crate) struct Handle {
 
     pub(crate) metrics: IoDriverMetrics,
 
-    #[cfg(all(
-        tokio_unstable,
-        feature = "io-uring",
-        feature = "rt",
-        feature = "fs",
-        target_os = "linux",
-    ))]
+    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
     pub(crate) uring_fd: Mutex<UringState>,
 }
 
@@ -201,6 +187,7 @@ impl Driver {
             } else if token == TOKEN_SIGNAL {
                 self.signal_ready = true;
             } else if token == TOKEN_WAKEUP_ALL {
+                #[cfg(all(tokio_unstable, feature = "tracing"))]
                 tracing::trace!("driver turn, wake all");
                 let _ = with_current(|c| c.notify_all());
             } else {
@@ -222,6 +209,7 @@ impl Driver {
 
         #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
         {
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
             tracing::trace!("driver turn, dispatching uring completions");
             let _ = handle.with_uring(|ctx| ctx.dispatch_completions());
         }
