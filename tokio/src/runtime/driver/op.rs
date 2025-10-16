@@ -5,6 +5,7 @@ use crate::runtime::Handle;
 use crate::sync::oneshot;
 use io_uring::cqueue;
 use io_uring::squeue::Entry;
+use std::any::type_name;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -89,7 +90,7 @@ pub(crate) trait Cancellable {
 
 impl<T: Cancellable> Unpin for Op<T> {}
 
-impl<T: Cancellable + Completable + Send> Future for Op<T> {
+impl<T: Cancellable + Completable + Send + std::fmt::Debug> Future for Op<T> {
     type Output = Result<T::Output, (io::Error, T::Error)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -101,19 +102,23 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                 let (tx, rx) = oneshot::channel();
                 let data = this
                     .take_data()
-                    .expect("Data must be some when initializing")
-                    .cancel_data();
+                    .expect("Data must be some when initializing");
 
                 let handle = &mut this.handle;
                 let driver = handle.inner.driver().io();
 
+                #[cfg(all(tokio_unstable, feature = "tracing"))]
+                tracing::trace!("registering uring op {} - {:?}", type_name::<T>(), &entry);
+
                 // SAFETY: entry is valid for the entire duration of the operation
                 unsafe {
-                    driver.register_op(entry, tx, data).map_err(|e| {
-                        // If registration fails, we need to return the data back to the caller
-                        let data = T::from_data(e.1).error();
-                        (e.0, data)
-                    })?
+                    driver
+                        .register_op(entry, tx, data.cancel_data())
+                        .map_err(|e| {
+                            // If registration fails, we need to return the data back to the caller
+                            let data = T::from_data(e.1).error();
+                            (e.0, data)
+                        })?
                 };
 
                 this.state = State::Polled(rx);

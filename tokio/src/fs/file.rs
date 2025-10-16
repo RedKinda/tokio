@@ -821,7 +821,7 @@ impl AsyncWrite for File {
                                         u64::MAX // -1, uses current cursor
                                     };
 
-                                    let op = Op::write_at(std, buf, offset)?;
+                                    let op = Op::write_at(std, buf, offset);
 
                                     let handle = BoxedOp(Box::pin(async move {
                                         match op.await {

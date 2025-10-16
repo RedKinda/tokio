@@ -580,6 +580,11 @@ impl Context {
                 core.stats.start_processing_scheduled_tasks();
                 core = self.run_task(task, core)?;
             } else {
+                #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+                if self.worker.handle.driver.io.drive_uring_completions() {
+                    continue;
+                }
+
                 // Wait for work
                 core = if !self.defer.is_empty() {
                     self.park_timeout(core, Some(Duration::from_millis(0)))

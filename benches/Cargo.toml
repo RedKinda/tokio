@@ -98,5 +98,10 @@ name = "time_timeout"
 path = "time_timeout.rs"
 harness = false
 
+[[bench]]
+name = "uring"
+path = "uring.rs"
+harness = false
+
 [lints]
 workspace = true

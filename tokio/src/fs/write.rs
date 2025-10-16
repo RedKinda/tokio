@@ -70,14 +70,14 @@ async fn write_uring(path: &Path, mut buf: Buf) -> io::Result<()> {
         .open(path)
         .await?;
 
-    let mut file = Arc::new(
+    let file = Arc::new(
         file.try_into_std()
             .expect("unexpected in-flight operation detected"),
     );
 
     let mut file_offset: u64 = 0;
     while !buf.is_empty() {
-        let (n, _buf, _file) = Op::write_at(file, buf, file_offset)?
+        let (n, _buf, _file) = Op::write_at(file.clone(), buf, file_offset)
             .await
             .map_err(|e| e.0)?;
 
@@ -87,7 +87,6 @@ async fn write_uring(path: &Path, mut buf: Buf) -> io::Result<()> {
 
         file_offset += n as u64;
         buf = _buf;
-        file = _file;
     }
 
     Ok(())

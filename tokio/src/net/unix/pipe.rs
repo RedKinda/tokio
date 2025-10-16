@@ -1,15 +1,20 @@
 //! Unix pipe types.
 
+use crate::io::blocking::Buf;
 use crate::io::interest::Interest;
-use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf, Ready};
+use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf, Ready, uring};
+use crate::runtime::driver::op::Op;
 
 use mio::unix::pipe as mio_pipe;
+use std::fmt;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 cfg_io_util! {
@@ -1438,5 +1443,201 @@ fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+pub fn make_uring_pipe() -> io::Result<(UringSender, UringReceiver)> {
+    unsafe {
+        let mut fds = [-1i32; 2];
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            UringSender::from_owned_fd_unchecked(OwnedFd::from_raw_fd(fds[1])),
+            UringReceiver::from_owned_fd_unchecked(OwnedFd::from_raw_fd(fds[0])),
+        ))
+    }
+}
+
+pub struct UringSender {
+    fd: Arc<OwnedFd>,
+}
+
+impl UringSender {
+    pub unsafe fn from_owned_fd_unchecked(fd: OwnedFd) -> Self {
+        UringSender { fd: Arc::new(fd) }
+    }
+
+    pub fn submit_write(&self, buf: Buf) -> SenderWriteOp {
+        SenderWriteOp {
+            fd: Arc::new(self.fd.clone()),
+            state: Some(WriteOpState::Pending(buf)),
+        }
+    }
+
+    pub async fn write_all(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let mut total_written = 0;
+        let mut buf = Buf::from_vec(buf);
+
+        loop {
+            if buf.is_empty() {
+                return (Ok(total_written), buf.into_vec());
+            }
+
+            let (res, _buf) = self.submit_write(buf).await;
+            if res.is_err() {
+                return (res, _buf.into_vec());
+            }
+            let n = res.unwrap();
+
+            if n == 0 {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    )),
+                    _buf.into_vec(),
+                );
+            }
+            total_written += n;
+            buf = _buf;
+        }
+    }
+}
+
+pub struct UringReceiver {
+    fd: Arc<OwnedFd>,
+}
+
+impl UringReceiver {
+    pub unsafe fn from_owned_fd_unchecked(fd: OwnedFd) -> Self {
+        UringReceiver { fd: Arc::new(fd) }
+    }
+
+    pub fn submit_read(&self, buf: Vec<u8>) -> ReceiverReadOp {
+        ReceiverReadOp {
+            fd: Arc::new(self.fd.clone()),
+            state: Some(ReadOpState::Pending(buf)),
+        }
+    }
+
+    pub async fn read_all(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let mut total_read = 0;
+
+        loop {
+            if buf.capacity() == buf.len() {
+                return (Ok(total_read), buf);
+            }
+
+            let (res, _buf) = self.submit_read(buf).await;
+            if res.is_err() {
+                return (res, _buf);
+            }
+            let n = res.unwrap();
+
+            if n == 0 {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to read whole buffer",
+                    )),
+                    _buf,
+                );
+            }
+            total_read += n;
+            buf = _buf;
+        }
+    }
+}
+
+enum WriteOpState {
+    Pending(Buf),
+    InProgress(Op<uring::write::Write>),
+}
+
+struct SenderWriteOp {
+    fd: Arc<dyn AsRawFd + Sync + Send>,
+    state: Option<WriteOpState>,
+}
+
+impl Future for SenderWriteOp {
+    type Output = (io::Result<usize>, Buf);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            if self.state.is_none() {
+                panic!("polled after completion");
+            }
+
+            match self.state.take().unwrap() {
+                WriteOpState::Pending(buf) => {
+                    if buf.is_empty() {
+                        return Poll::Ready((Ok(0), buf));
+                    }
+
+                    let op = Op::write_at(Arc::clone(&self.fd), buf, 0);
+                    self.state = Some(WriteOpState::InProgress(op));
+                }
+                WriteOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
+                    Poll::Ready(Ok(n)) => {
+                        let (written, buf, _) = n;
+                        return Poll::Ready((Ok(written as usize), buf));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready((Err(e.0), e.1.0));
+                    }
+                    Poll::Pending => {
+                        self.state = Some(WriteOpState::InProgress(op));
+                        return Poll::Pending;
+                    }
+                },
+            };
+        }
+    }
+}
+
+enum ReadOpState {
+    Pending(Vec<u8>),
+    InProgress(Op<uring::read::Read>),
+}
+
+struct ReceiverReadOp {
+    fd: Arc<dyn AsRawFd + Sync + Send>,
+    state: Option<ReadOpState>,
+}
+
+impl Future for ReceiverReadOp {
+    type Output = (io::Result<usize>, Vec<u8>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            if self.state.is_none() {
+                panic!("polled after completion");
+            }
+
+            match self.state.take().unwrap() {
+                ReadOpState::Pending(buf) => {
+                    if buf.capacity() == buf.len() {
+                        return Poll::Ready((Ok(0), buf));
+                    }
+
+                    let op = Op::read_at(Arc::clone(&self.fd), buf, 0);
+                    self.state = Some(ReadOpState::InProgress(op));
+                }
+                ReadOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
+                    Poll::Ready(Ok(n)) => {
+                        let (read, buf, _) = n;
+                        return Poll::Ready((Ok(read as usize), buf));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready((Err(e.0), e.1.0));
+                    }
+                    Poll::Pending => {
+                        self.state = Some(ReadOpState::InProgress(op));
+                        return Poll::Pending;
+                    }
+                },
+            };
+        }
     }
 }

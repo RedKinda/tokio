@@ -200,6 +200,14 @@ impl Buf {
         }
     }
 
+    pub(crate) fn from_vec(buf: Vec<u8>) -> Buf {
+        Buf { buf, pos: 0 }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -238,11 +246,6 @@ impl Buf {
     pub(crate) fn advance(&mut self, n: usize) {
         assert!(n <= self.len());
         self.pos += n;
-
-        if self.pos == self.buf.len() {
-            self.buf.truncate(0);
-            self.pos = 0;
-        }
     }
 
     /// # Safety

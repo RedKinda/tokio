@@ -72,8 +72,8 @@ impl UringContextInner {
                 uring.setup_attach_wq(fd);
             }
 
-            // uring.setup_single_issuer();
-            // uring.setup_coop_taskrun()
+            uring.setup_single_issuer();
+            uring.setup_coop_taskrun();
 
             uring.build(DEFAULT_RING_SIZE)
         };
@@ -404,9 +404,6 @@ impl Handle {
         }
 
         // Uring is initialized.
-
-        #[cfg(all(tokio_unstable, feature = "tracing"))]
-        tracing::trace!("registering uring op {:?}", &entry);
 
         self.with_uring(|ctx| {
             let index = ctx.ops.insert((sender, cancel_data));
