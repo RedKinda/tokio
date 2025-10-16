@@ -385,15 +385,8 @@ impl Context {
 
         #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
         {
-            let (c, completions_dispatched_inner) = self.enter(core, || {
-                handle
-                    .driver
-                    .io
-                    .as_ref()
-                    .map(|io| io.with_uring(|u| u.dispatch_completions() > 0))
-                    .unwrap_or(Ok(false))
-                    .unwrap_or(false)
-            });
+            let (c, completions_dispatched_inner) =
+                self.enter(core, || handle.driver.io.drive_uring_completions());
             core = c;
             completions_dispatched = completions_dispatched_inner;
         }
@@ -748,6 +741,13 @@ impl CoreGuard<'_> {
             let waker = Handle::waker_ref(&context.handle);
             let mut cx = std::task::Context::from_waker(&waker);
 
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
+            {
+                context.handle.driver.io.init_uring(waker.clone()).expect(
+                    "Failed to initialize uring, but it is supported - this should be unreachable",
+                );
+            }
+
             pin!(future);
 
             core.metrics.start_processing_scheduled_tasks();
@@ -780,6 +780,19 @@ impl CoreGuard<'_> {
                     let task = match entry {
                         Some(entry) => entry,
                         None => {
+                            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
+                            {
+                                let (c, res) = context.enter(core, || {
+                                    context.handle.driver.io.drive_uring_completions()
+                                });
+
+                                core = c;
+                                if res {
+                                    // If we dispatched completions, try polling the `block_on` future next
+                                    continue 'outer;
+                                }
+                            }
+
                             core.metrics.end_processing_scheduled_tasks();
 
                             core = if !context.defer.is_empty() {

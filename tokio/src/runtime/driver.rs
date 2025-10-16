@@ -143,6 +143,7 @@ cfg_io_driver! {
         Disabled(UnparkThread),
     }
 
+
     fn create_io_stack(
         enabled: bool,
         #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
@@ -203,6 +204,30 @@ cfg_io_driver! {
             match self {
                 IoHandle::Enabled(v) => Some(v),
                 IoHandle::Disabled(..) => None,
+            }
+        }
+    }
+}
+
+cfg_io_uring! {
+    use std::task::Waker;
+    impl IoHandle {
+        /// Returns true if any io-uring completions were dispatched.
+        pub(crate) fn drive_uring_completions(&self) -> bool {
+            match self {
+                IoHandle::Enabled(handle) => {
+                    handle.with_uring(|u| u.dispatch_completions() > 0).unwrap_or(false)
+                },
+                IoHandle::Disabled(..) => false,
+            }
+        }
+
+        pub(crate) fn init_uring(&self, waker: Waker) -> io::Result<bool> {
+            match self {
+                IoHandle::Enabled(handle) => {
+                    handle.init_uring(waker)
+                },
+                IoHandle::Disabled(..) => Ok(false),
             }
         }
     }

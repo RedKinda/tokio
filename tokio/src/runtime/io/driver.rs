@@ -10,7 +10,6 @@ cfg_io_uring! {
 use crate::io::interest::Interest;
 use crate::io::ready::Ready;
 use crate::loom::sync::Mutex;
-use crate::runtime::context::with_current;
 use crate::runtime::driver;
 use crate::runtime::io::registration_set;
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
@@ -52,7 +51,7 @@ pub(crate) struct Handle {
     pub(crate) metrics: IoDriverMetrics,
 
     #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-    pub(crate) uring_fd: Mutex<UringState>,
+    pub(crate) uring_state: Mutex<UringState>,
 }
 
 #[derive(Debug)]
@@ -87,7 +86,6 @@ pub(super) enum Tick {
 
 const TOKEN_WAKEUP: mio::Token = mio::Token(0);
 const TOKEN_SIGNAL: mio::Token = mio::Token(1);
-const TOKEN_WAKEUP_ALL: mio::Token = mio::Token(2);
 
 fn _assert_kinds() {
     fn _assert<T: Send + Sync>() {}
@@ -125,7 +123,7 @@ impl Driver {
             waker,
             metrics: IoDriverMetrics::default(),
             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-            uring_fd: Mutex::new(if enabled_uring {
+            uring_state: Mutex::new(if enabled_uring {
                 uring::UringState::Uninitialized
             } else {
                 uring::UringState::Disabled
@@ -186,10 +184,6 @@ impl Driver {
                 // Nothing to do, the event is used to unblock the I/O driver
             } else if token == TOKEN_SIGNAL {
                 self.signal_ready = true;
-            } else if token == TOKEN_WAKEUP_ALL {
-                #[cfg(all(tokio_unstable, feature = "tracing"))]
-                tracing::trace!("driver turn, wake all");
-                let _ = with_current(|c| c.notify_all());
             } else {
                 let ready = Ready::from_mio(event);
                 let ptr = super::EXPOSE_IO.from_exposed_addr(token.0);

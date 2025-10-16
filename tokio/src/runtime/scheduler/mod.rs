@@ -158,15 +158,6 @@ cfg_rt! {
             }
         }
 
-        pub(crate) fn notify_all(&self) {
-            match *self {
-                Handle::CurrentThread(_) => {},
-
-                #[cfg(feature = "rt-multi-thread")]
-                Handle::MultiThread(ref h) => h.notify_all(),
-            }
-        }
-
         pub(crate) fn seed_generator(&self) -> &RngSeedGenerator {
             match_flavor!(self, Handle(h) => &h.seed_generator)
         }

@@ -6,7 +6,7 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["io-uring"]
+default = []
 test-util = ["tokio/test-util"]
 io-uring = ["tokio/io-uring"]
 

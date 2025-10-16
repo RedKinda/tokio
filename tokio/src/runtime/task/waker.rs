@@ -45,11 +45,11 @@ cfg_trace! {
     macro_rules! trace {
         ($header:expr, $op:expr) => {
             if let Some(id) = Header::get_tracing_id(&$header) {
-                tracing::trace!(
-                    target: "tokio::task::waker",
-                    op = $op,
-                    task.id = id.into_u64(),
-                );
+                // tracing::trace!(
+                //     target: "tokio::task::waker",
+                //     op = $op,
+                //     task.id = id.into_u64(),
+                // );
             }
         }
     }

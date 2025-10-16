@@ -279,6 +279,22 @@ impl CachedParkThread {
         let waker = self.waker()?;
         let mut cx = Context::from_waker(&waker);
 
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
+        {
+            use crate::runtime::context::with_current;
+            #[allow(unused_variables)]
+            let err = with_current(|c| {
+                c.driver().io.init_uring(waker.clone()).expect(
+                    "Failed to initialize uring, but it is supported - this should be unreachable",
+                )
+            });
+
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            if let Err(ref e) = err {
+                tracing::error!("io-uring initialization error: {e}");
+            }
+        }
+
         pin!(f);
 
         loop {
@@ -289,15 +305,8 @@ impl CachedParkThread {
             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
             {
                 use crate::runtime::context::with_current;
-                let completions_dispatched = with_current(|c| {
-                    c.driver()
-                        .io
-                        .as_ref()
-                        .map(|io| io.with_uring(|u| u.dispatch_completions() > 0))
-                        .unwrap_or(Ok(false))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+                let completions_dispatched =
+                    with_current(|c| c.driver().io.drive_uring_completions()).unwrap_or(false);
 
                 if completions_dispatched {
                     continue;

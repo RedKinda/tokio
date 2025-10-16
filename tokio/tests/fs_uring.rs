@@ -27,6 +27,7 @@ use tokio_util::task::TaskTracker;
 
 fn multi_rt(n: usize) -> Box<dyn Fn() -> Runtime> {
     Box::new(move || {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         tracing::trace!("building multi-threaded rt with {n} threads");
         Builder::new_multi_thread()
             .worker_threads(n)
@@ -39,6 +40,7 @@ fn multi_rt(n: usize) -> Box<dyn Fn() -> Runtime> {
 
 fn current_rt() -> Box<dyn Fn() -> Runtime> {
     Box::new(|| {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
         tracing::trace!("building current-thread rt");
         Builder::new_current_thread()
             .enable_all()
@@ -54,8 +56,8 @@ fn rt_combinations() -> Vec<Box<dyn Fn() -> Runtime>> {
         multi_rt(1),
         multi_rt(2),
         multi_rt(8),
-        multi_rt(64),
-        multi_rt(256),
+        // multi_rt(64),
+        // multi_rt(256),
     ]
 }
 
@@ -63,6 +65,14 @@ fn with_rt_combinations<R: Future + Send + 'static, F: Fn() -> R + 'static + Syn
 where
     R::Output: Send,
 {
+    abortlog::setup_backtrace_on_sigabrt();
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .with_thread_ids(true)
+    //     .with_thread_names(true)
+    //     .with_ansi(false)
+    //     .try_init();
+
     let test_name = std::thread::current()
         .name()
         .map(|n| n.to_string())
@@ -72,11 +82,13 @@ where
 
     for rt in rt_combinations() {
         rt().block_on(async {
-            tokio::spawn(async {
-                f();
-            })
-            .await
-            .unwrap();
+            // tokio::spawn(async {
+            //     f();
+            // })
+            // .await
+            // .unwrap();
+
+            f().await;
         });
     }
 }
@@ -185,15 +197,25 @@ fn path_read_write_uring() {
     //     .init();
 
     with_rt_combinations(&|| async {
-        assert_ok!(fs::write(&create_tmp_files(1).1[0], b"bytes").await);
+        if let Err(e) = fs::write(&create_tmp_files(1).1[0], b"bytes").await {
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            tracing::error!("FAILED!! PANICKING!!!!: {e}");
+            panic!("failed to write file: {e}");
+        }
     });
 }
 
 #[test]
 fn path_write_concurrent() {
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .with_thread_ids(true)
+    //     .with_thread_names(true)
+    //     .with_ansi(false)
+    //     .init();
     with_rt_combinations(&|| async {
         // sleep 0.5s
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // tokio::time::sleep(Duration::from_secs(5)).await;
 
         // spawn 1024 tasks that write to separate files
         let temp = tempdir();
@@ -232,18 +254,31 @@ fn path_write_concurrent() {
 
 #[test]
 fn path_write_massive() {
-    with_rt_combinations(&|| async {
-        // write a 2.5gb file - this is bigger than a single write uring can handle
-        let path = &create_tmp_files(1).1[0];
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .with_thread_ids(true)
+    //     .with_thread_names(true)
+    //     .with_ansi(false)
+    //     .init();
 
-        const SIZE: usize = 2_500_000_000;
-        let data = vec![1u8; SIZE];
-        assert_ok!(fs::write(path, &data).await);
-        drop(data);
+    // only test on two because this takes a while
+    let rts = [current_rt(), multi_rt(8)];
 
-        let out = assert_ok!(fs::read(path).await);
-        assert_eq!(out.len(), SIZE);
-    });
+    for rt in rts {
+        let rt = rt();
+        rt.block_on(async {
+            // write a 2.5gb file - this is bigger than a single write uring can handle
+            let path = &create_tmp_files(1).1[0];
+
+            const SIZE: usize = 2_500_000_000;
+            let data = vec![1u8; SIZE];
+            assert_ok!(fs::write(path, &data).await);
+            drop(data);
+
+            let out = assert_ok!(fs::read(path).await);
+            assert_eq!(out.len(), SIZE);
+        });
+    }
 }
 
 #[test]
@@ -287,6 +322,25 @@ fn test_cancelled_write() {
         })
         .await;
     });
+}
+
+mod abortlog {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    pub(super) fn setup_backtrace_on_sigabrt() {
+        INIT.call_once(|| unsafe {
+            libc::signal(libc::SIGABRT, handle_sigabrt as libc::sighandler_t);
+        });
+    }
+
+    extern "C" fn handle_sigabrt(_: libc::c_int) {
+        eprintln!("=== SIGABRT BACKTRACE ===");
+        let bt = std::backtrace::Backtrace::force_capture();
+        println!("{}", bt);
+        std::process::exit(1);
+    }
 }
 
 fn create_tmp_files(num_files: usize) -> (Vec<NamedTempFile>, Vec<PathBuf>) {

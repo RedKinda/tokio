@@ -1,4 +1,4 @@
-use super::{EnterRuntime, CONTEXT};
+use super::{CONTEXT, EnterRuntime};
 
 use crate::loom::thread::AccessError;
 use crate::util::markers::NotSendOrSync;

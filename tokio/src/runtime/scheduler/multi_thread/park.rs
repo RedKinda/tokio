@@ -5,6 +5,7 @@
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::{Arc, Condvar, Mutex};
 use crate::runtime::driver::{self, Driver};
+use crate::runtime::scheduler::multi_thread;
 use crate::util::TryLock;
 
 use std::sync::atomic::Ordering::SeqCst;
@@ -107,6 +108,21 @@ impl Clone for Parker {
 impl Unparker {
     pub(crate) fn unpark(&self, driver: &driver::Handle) {
         self.inner.unpark(driver);
+    }
+}
+
+pub(crate) struct MultiThreadUnpark {
+    pub(crate) handle: Arc<multi_thread::Handle>,
+    pub(crate) unparker: Unparker,
+}
+
+impl crate::util::Wake for MultiThreadUnpark {
+    fn wake(arc_self: Arc<Self>) {
+        arc_self.unparker.unpark(&arc_self.handle.driver);
+    }
+
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.unparker.unpark(&arc_self.handle.driver);
     }
 }
 

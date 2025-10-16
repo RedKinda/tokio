@@ -114,7 +114,26 @@ enum State {
 enum JoinHandleInner<T> {
     Blocking(JoinHandle<T>),
     #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
-    Async(crate::task::JoinHandle<T>),
+    Async(BoxedOp<T>),
+}
+
+struct BoxedOp<T>(Pin<Box<dyn Future<Output = T> + Send + 'static>>);
+
+impl<T> std::fmt::Debug for BoxedOp<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // format of BoxedFuture(T::type_name())
+        f.debug_tuple("BoxedFuture")
+            .field(&std::any::type_name::<T>())
+            .finish()
+    }
+}
+
+impl<T> Future for BoxedOp<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
 }
 
 impl Future for JoinHandleInner<(Operation, Buf)> {
@@ -126,9 +145,7 @@ impl Future for JoinHandleInner<(Operation, Buf)> {
                 .poll(cx)
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
-            JoinHandleInner::Async(ref mut jh) => Pin::new(jh)
-                .poll(cx)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "background task failed")),
+            JoinHandleInner::Async(ref mut jh) => Pin::new(jh).poll(cx).map(Ok),
         }
     }
 }
@@ -788,7 +805,7 @@ impl AsyncWrite for File {
 
                         // Handle not present in some tests?
                         if let Ok(handle) = Handle::try_current() {
-                            if handle.inner.driver().io().check_and_init()? {
+                            if handle.inner.driver().io().check_uring()? {
                                 task_join_handle = {
                                     use crate::runtime::driver::op::Op;
 
@@ -806,12 +823,12 @@ impl AsyncWrite for File {
 
                                     let op = Op::write_at(std, buf, offset)?;
 
-                                    let handle = crate::spawn(async move {
+                                    let handle = BoxedOp(Box::pin(async move {
                                         match op.await {
                                             Ok(n) => (Operation::Write(Ok(())), n.1),
                                             Err(e) => (Operation::Write(Err(e.0)), e.1.0),
                                         }
-                                    });
+                                    }));
 
                                     Some(JoinHandleInner::Async(handle))
                                 };
