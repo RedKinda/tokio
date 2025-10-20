@@ -2,7 +2,7 @@
 
 use tokio_stream::StreamExt;
 
-use tokio::fs::File;
+use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
@@ -111,14 +111,20 @@ fn async_write_one(c: &mut Criterion) {
     let data: &'static mut [u8] = Box::leak(vec![0u8; WRITE_SIZE].into_boxed_slice());
 
     c.bench_function("async_write_one", |b| {
+        std::fs::create_dir_all("./tmp").unwrap();
+
         b.iter(|| {
             let task = || async {
-                let mut file = File::open("/dev/null").await.unwrap();
-                file.write_all(data).await.unwrap();
+                // let mut file = File::open("/dev/null").await.unwrap();
+                // file.write_all(data).await.unwrap();
+                fs::write("./tmp/onefile", &data).await.unwrap();
             };
 
             rt.block_on(task());
         });
+
+        // purge the folder
+        std::fs::remove_dir_all("./tmp").unwrap();
     });
 }
 
@@ -130,32 +136,52 @@ fn async_write_a_lot(c: &mut Criterion) {
     let data: &'static mut [u8] = Box::leak(vec![0u8; WRITE_SIZE].into_boxed_slice());
 
     c.bench_function("async_write_a_lot", |b| {
-        b.iter(|| {
-            let task_inner = || async {
-                let mut file = File::options()
-                    .append(true)
-                    .open("/dev/null")
-                    .await
-                    .unwrap();
+        b.iter_custom(|iters| {
+            let task_inner = |taskid: usize| {
+                let data: &'static [u8] = data;
+                async move {
+                    // let mut file = File::options()
+                    //     .append(true)
+                    //     .open("/dev/null")
+                    //     .await
+                    //     .unwrap();
 
-                for i in 0..WRITE_COUNT {
-                    file.write_all(data).await.unwrap();
+                    // for i in 0..WRITE_COUNT {
+                    //     file.write_all(data).await.unwrap();
+                    // }
+
+                    for i in 0..WRITE_COUNT {
+                        fs::write(format!("./tmp/filelot{taskid}-{i}"), &data)
+                            .await
+                            .unwrap();
+                    }
                 }
             };
 
             let task = || async {
-                let mut tasks = vec![];
-                for _ in 0..32 {
-                    tasks.push(tokio::spawn(async move {
-                        task_inner().await;
-                    }));
-                }
-                for task in tasks {
-                    task.await.unwrap();
+                for _iter in 0..iters {
+                    let mut tasks = vec![];
+                    for taskid in 0..32 {
+                        tasks.push(tokio::spawn(async move {
+                            task_inner(taskid).await;
+                        }));
+                    }
+                    for task in tasks {
+                        task.await.unwrap();
+                    }
                 }
             };
 
+            // make the tmp folder
+            std::fs::create_dir_all("./tmp").unwrap();
+
+            let now = std::time::Instant::now();
             rt.block_on(task());
+            let elapsed = now.elapsed();
+
+            // purge the folder
+            std::fs::remove_dir_all("./tmp").unwrap();
+            elapsed
         });
     });
 }
