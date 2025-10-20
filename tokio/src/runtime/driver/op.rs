@@ -1,13 +1,13 @@
 use crate::io::uring::open::Open;
 use crate::io::uring::read::Read;
 use crate::io::uring::write::Write;
-use crate::runtime::Handle;
+use crate::io::uring::write::WriteVectored;
 use crate::sync::oneshot;
 use io_uring::cqueue;
 use io_uring::squeue::Entry;
-use std::any::type_name;
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -19,20 +19,19 @@ use std::task::Poll;
 pub(crate) enum CancelData {
     Open(Open),
     Write(Write),
+    WriteVectored(WriteVectored),
     Read(Read),
 }
 
-pub(crate) enum State {
-    Initialize(Option<Entry>),
+pub(crate) enum State<T: Cancellable> {
+    Initialize(Entry, T),
     Polled(oneshot::Receiver<(CqeResult, CancelData)>),
-    Complete,
+    CompleteOrInvalid,
 }
 
 pub(crate) struct Op<T: Cancellable> {
     // State of this Op
-    state: State,
-    // Per operation data.
-    data: Option<T>,
+    state: State<T>,
 }
 
 impl<T: Cancellable> Op<T> {
@@ -42,8 +41,7 @@ impl<T: Cancellable> Op<T> {
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
     pub(crate) unsafe fn new(entry: Entry, data: T) -> Self {
         Self {
-            data: Some(data),
-            state: State::Initialize(Some(entry)),
+            state: State::Initialize(entry, data),
         }
     }
 }
@@ -89,13 +87,8 @@ impl<T: Cancellable + Completable + Send + std::fmt::Debug> Future for Op<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        match &mut this.state {
-            State::Initialize(entry_opt) => {
-                let (entry, data) = match (entry_opt.take(), this.data.take()) {
-                    (Some(e), Some(d)) => (e, d),
-                    _ => panic!("Entry and Data must be present when initializing"),
-                };
-
+        match mem::replace(&mut this.state, State::CompleteOrInvalid) {
+            State::Initialize(entry, data) => {
                 let (tx, rx) = oneshot::channel();
 
                 crate::runtime::io::uring::with_current_uring(|uring| {
@@ -122,29 +115,32 @@ impl<T: Cancellable + Completable + Send + std::fmt::Debug> Future for Op<T> {
                 .expect("uring is always available here")
             }
 
-            State::Polled(rx) => {
+            State::Polled(mut rx) => {
                 // poll the receiver
-                match Pin::new(rx).poll(cx) {
+                match Pin::new(&mut rx).poll(cx) {
                     Poll::Ready(Ok((cqe, data))) => {
-                        this.state = State::Complete;
+                        this.state = State::CompleteOrInvalid;
                         let d = T::from_data(data).complete(cqe);
                         Poll::Ready(d)
                     }
                     Poll::Ready(Err(_)) => {
                         // The sender was dropped, which means the operation was cancelled.
                         // This shouldnt happen, maybe panic here instead?
-                        this.state = State::Complete;
+                        this.state = State::CompleteOrInvalid;
                         panic!("oneshot sender dropped, operation was cancelled");
                         // Poll::Ready(Err(io::Error::new(
                         //     io::ErrorKind::Other,
                         //     "operation cancelled",
                         // )))
                     }
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => {
+                        this.state = State::Polled(rx);
+                        Poll::Pending
+                    }
                 }
             }
 
-            State::Complete => {
+            State::CompleteOrInvalid => {
                 panic!("Future polled after completion");
             }
         }

@@ -1448,6 +1448,7 @@ fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
 cfg_io_uring! {
 
 use crate::runtime::driver::op::Op;
+use std::mem;
 
 
 pub fn make_uring_pipe() -> io::Result<(UringSender, UringReceiver)> {
@@ -1473,10 +1474,7 @@ impl UringSender {
     }
 
     pub fn submit_write(&self, buf: Buf) -> SenderWriteOp {
-        SenderWriteOp {
-            fd: Some(Arc::new(self.fd.clone())),
-            state: Some(WriteOpState::Pending(buf)),
-        }
+        SenderWriteOp::new(self.fd.clone(), buf)
     }
 
     pub async fn write_all(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
@@ -1561,21 +1559,20 @@ impl UringReceiver {
 }
 
 enum WriteOpState {
-    Pending(Buf),
+    Pending(Buf, Arc<dyn AsRawFd + Sync + Send>),
     InProgress(Op<uring::write::Write>),
+    Completed,
 }
 
 struct SenderWriteOp {
-    state: Option<WriteOpState>,
-    // fd is present when state is Some(Pending)
-    fd: Option<Arc<dyn AsRawFd + Sync + Send>>,
+    state: WriteOpState,
 }
 
 impl SenderWriteOp {
     fn new(fd: Arc<dyn AsRawFd + Sync + Send>, buf: Buf) -> Self {
         SenderWriteOp {
-            state: Some(WriteOpState::Pending(buf)),
-            fd: Some(fd),
+            state: WriteOpState::Pending(buf, fd),
+
         }
     }
 }
@@ -1585,20 +1582,14 @@ impl Future for SenderWriteOp {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            if self.state.is_none() {
-                panic!("polled after completion");
-            }
-
-            match self.state.take().unwrap() {
-                WriteOpState::Pending(buf) => {
-                    // we have the fd when pending
-                    let fd = self.fd.take().unwrap();
+            match mem::replace(&mut self.state, WriteOpState::Completed) {
+                WriteOpState::Pending(buf, fd) => {
                     if buf.is_empty() {
                         return Poll::Ready((Ok(0), buf, fd));
                     }
 
                     let op = Op::write_at(fd, buf, 0);
-                    self.state = Some(WriteOpState::InProgress(op));
+                    self.state = WriteOpState::InProgress(op);
                 }
                 WriteOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
                     Poll::Ready(Ok(n)) => {
@@ -1609,31 +1600,32 @@ impl Future for SenderWriteOp {
                         return Poll::Ready((Err(e.0), e.1.0, e.1.1));
                     }
                     Poll::Pending => {
-                        self.state = Some(WriteOpState::InProgress(op));
+                        self.state = WriteOpState::InProgress(op);
                         return Poll::Pending;
                     }
                 },
+                WriteOpState::Completed => {
+                    panic!("polled after completion");
+                }
             };
         }
     }
 }
 
 enum ReadOpState {
-    Pending(Vec<u8>),
+    Pending(Vec<u8>, Arc<dyn AsRawFd + Sync + Send>),
     InProgress(Op<uring::read::Read>),
+    Completed,
 }
 
 struct ReceiverReadOp {
-    state: Option<ReadOpState>,
-    // fd is present when state is Some(Pending)
-    fd: Option<Arc<dyn AsRawFd + Sync + Send>>
+    state: ReadOpState,
 }
 
 impl ReceiverReadOp {
     fn new(fd: Arc<dyn AsRawFd + Sync + Send>, buf: Vec<u8>) -> Self {
         ReceiverReadOp {
-            state: Some(ReadOpState::Pending(buf)),
-            fd: Some(fd),
+            state: ReadOpState::Pending(buf, fd)
         }
     }
 }
@@ -1643,20 +1635,14 @@ impl Future for ReceiverReadOp {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            if self.state.is_none() {
-                panic!("polled after completion");
-            }
-
-            match self.state.take().unwrap() {
-                ReadOpState::Pending(buf) => {
-                    // if we are pending, we have the fd
-                    let fd = self.fd.take().unwrap();
+            match mem::replace(&mut self.state, ReadOpState::Completed) {
+                ReadOpState::Pending(buf, fd) => {
                     if buf.capacity() == buf.len() {
                         return Poll::Ready((Ok(0), buf, fd));
                     }
 
                     let op = Op::read_at(fd, buf, 0);
-                    self.state = Some(ReadOpState::InProgress(op));
+                    self.state = ReadOpState::InProgress(op);
                 }
                 ReadOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
                     Poll::Ready(Ok(n)) => {
@@ -1667,10 +1653,13 @@ impl Future for ReceiverReadOp {
                         return Poll::Ready((Err(e.0), e.1.0, e.1.1));
                     }
                     Poll::Pending => {
-                        self.state = Some(ReadOpState::InProgress(op));
+                        self.state = ReadOpState::InProgress(op);
                         return Poll::Pending;
                     }
                 },
+                ReadOpState::Completed => {
+                    panic!("polled after completion");
+                }
             };
         }
     }
