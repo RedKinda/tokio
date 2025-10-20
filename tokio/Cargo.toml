@@ -23,7 +23,7 @@ keywords = ["io", "async", "non-blocking", "futures"]
 
 [features]
 # Include nothing by default
-default = ["full", "tracing", "io-uring"]
+default = ["full", "io-uring"]
 
 # enable everything
 full = [

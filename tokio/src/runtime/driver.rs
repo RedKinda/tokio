@@ -213,10 +213,10 @@ cfg_io_uring! {
     use std::task::Waker;
     impl IoHandle {
         /// Returns true if any io-uring completions were dispatched.
-        pub(crate) fn drive_uring_completions(&self) -> bool {
+        pub(crate) fn drive_uring_completions(&self, before_park: bool) -> bool {
             match self {
                 IoHandle::Enabled(handle) => {
-                    handle.with_uring(|u| u.dispatch_completions() > 0).unwrap_or(false)
+                    handle.with_uring(|u| u.dispatch_completions(before_park) > 0).unwrap_or(false)
                 },
                 IoHandle::Disabled(..) => false,
             }

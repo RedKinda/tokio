@@ -29,8 +29,6 @@ pub(crate) enum State {
 }
 
 pub(crate) struct Op<T: Cancellable> {
-    // Handle to the runtime
-    handle: Handle,
     // State of this Op
     state: State,
     // Per operation data.
@@ -43,15 +41,10 @@ impl<T: Cancellable> Op<T> {
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
     pub(crate) unsafe fn new(entry: Entry, data: T) -> Self {
-        let handle = Handle::current();
         Self {
-            handle,
             data: Some(data),
             state: State::Initialize(Some(entry)),
         }
-    }
-    pub(crate) fn take_data(&mut self) -> Option<T> {
-        self.data.take()
     }
 }
 
@@ -98,37 +91,35 @@ impl<T: Cancellable + Completable + Send + std::fmt::Debug> Future for Op<T> {
 
         match &mut this.state {
             State::Initialize(entry_opt) => {
-                let entry = entry_opt.take().expect("Entry must be present");
-                let (tx, rx) = oneshot::channel();
-                let data = this
-                    .take_data()
-                    .expect("Data must be some when initializing");
-
-                let handle = &mut this.handle;
-                let driver = handle.inner.driver().io();
-
-                #[cfg(all(tokio_unstable, feature = "tracing"))]
-                tracing::trace!("registering uring op {} - {:?}", type_name::<T>(), &entry);
-
-                // SAFETY: entry is valid for the entire duration of the operation
-                unsafe {
-                    driver
-                        .register_op(entry, tx, data.cancel_data())
-                        .map_err(|e| {
-                            // If registration fails, we need to return the data back to the caller
-                            let data = T::from_data(e.1).error();
-                            (e.0, data)
-                        })?
+                let (entry, data) = match (entry_opt.take(), this.data.take()) {
+                    (Some(e), Some(d)) => (e, d),
+                    _ => panic!("Entry and Data must be present when initializing"),
                 };
 
-                this.state = State::Polled(rx);
+                let (tx, rx) = oneshot::channel();
 
-                // op has been submitted, we drive completions in case it completed immediately
-                let _ = driver.with_uring(|uring| uring.dispatch_completions());
+                crate::runtime::io::uring::with_current_uring(|uring| {
+                    #[cfg(all(tokio_unstable, feature = "tracing"))]
+                    tracing::trace!("registering uring op {} - {:?}", type_name::<T>(), &entry);
 
-                // immediately poll self again so that rx is polled and a waker is registered
-                pin!(this);
-                this.poll(cx)
+                    // SAFETY: entry is valid for the entire duration of the operation
+                    unsafe {
+                        if let Err(e) = uring.register_op(entry, tx, data.cancel_data()) {
+                            // If registration fails, we need to return the data back to the caller
+                            return Poll::Ready(Err((e.0, T::from_data(e.1).error())));
+                        }
+                    };
+
+                    this.state = State::Polled(rx);
+
+                    // op has been submitted, we drive completions in case it completed immediately, as this happens quite often
+                    let _ = uring.dispatch_completions(false);
+
+                    // immediately poll self again so that rx is polled and a waker is registered
+                    pin!(this);
+                    this.poll(cx)
+                })
+                .expect("uring is always available here")
             }
 
             State::Polled(rx) => {

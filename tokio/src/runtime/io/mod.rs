@@ -6,6 +6,10 @@ mod driver;
 use driver::{Direction, Tick};
 pub(crate) use driver::{Driver, Handle, ReadyEvent};
 
+cfg_io_uring! {
+    pub(crate) use driver::uring;
+}
+
 mod registration;
 pub(crate) use registration::Registration;
 

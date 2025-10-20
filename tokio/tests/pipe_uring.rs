@@ -18,7 +18,8 @@ use std::{future::poll_fn, path::PathBuf};
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::net::unix::pipe::make_uring_pipe;
+use tokio::net::unix::pipe::{make_uring_pipe, UringReceiver, UringSender};
+use tokio::task::JoinHandle;
 use tokio::{
     fs::OpenOptions,
     runtime::{Builder, Runtime},
@@ -55,8 +56,8 @@ fn rt_combinations() -> Vec<Box<dyn Fn() -> Runtime>> {
     vec![
         current_rt(),
         multi_rt(1),
-        multi_rt(2),
-        multi_rt(8),
+        multi_rt(4),
+        multi_rt(16),
         // multi_rt(64),
         // multi_rt(256),
     ]
@@ -66,12 +67,12 @@ fn with_rt_combinations<R: Future + Send + 'static, F: Fn() -> R + 'static + Syn
 where
     R::Output: Send,
 {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .with_ansi(false)
-        .try_init();
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .with_thread_ids(true)
+    //     .with_thread_names(true)
+    //     .with_ansi(false)
+    //     .try_init();
 
     let test_name = std::thread::current()
         .name()
@@ -111,6 +112,79 @@ fn test_uring_pipe() {
             res.unwrap();
             rx_buf = _buf;
             assert_eq!(rx_buf, [1u8; 1024])
+        }
+    });
+}
+
+fn stress_pipe_split(
+    mut tx: UringSender,
+    mut rx: UringReceiver,
+    mut tx_buf: Vec<u8>,
+    mut rx_buf: Vec<u8>,
+    iters: u64,
+) -> JoinHandle<()> {
+    let read_task = tokio::spawn(async move {
+        for _ in 0..iters {
+            rx_buf.truncate(0);
+            // panic!("now reading");
+            let (res, _buf) = rx.read_all(rx_buf).await;
+            res.unwrap();
+            rx_buf = _buf;
+        }
+    });
+
+    let write_task = tokio::spawn(async move {
+        for _ in 0..iters {
+            let (res, _buf) = tx.write_all(tx_buf).await;
+            res.unwrap();
+            tx_buf = _buf;
+        }
+    });
+
+    tokio::spawn(async move {
+        write_task.await.unwrap();
+        read_task.await.unwrap();
+    })
+}
+
+#[test]
+fn test_single_pipe() {
+    with_rt_combinations(&|| async {
+        let (tx, rx) = make_uring_pipe().unwrap();
+
+        let tx_buf = vec![1u8; 100 * 1024];
+        let rx_buf = vec![0u8; 100 * 1024];
+
+        let iters = 100;
+
+        stress_pipe_split(tx, rx, tx_buf, rx_buf, iters)
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn test_multi_pipe() {
+    with_rt_combinations(&|| async {
+        let tx_buf = vec![1u8; 100 * 1024];
+        let rx_buf = vec![0u8; 100 * 1024];
+
+        let iters = 100;
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let (tx, rx) = make_uring_pipe().unwrap();
+            handles.push(stress_pipe_split(
+                tx,
+                rx,
+                tx_buf.clone(),
+                rx_buf.clone(),
+                iters,
+            ));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
         }
     });
 }

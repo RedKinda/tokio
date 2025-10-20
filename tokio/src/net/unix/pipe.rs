@@ -3,7 +3,6 @@
 use crate::io::blocking::Buf;
 use crate::io::interest::Interest;
 use crate::io::{AsyncRead, AsyncWrite, PollEvented, ReadBuf, Ready, uring};
-use crate::runtime::driver::op::Op;
 
 use mio::unix::pipe as mio_pipe;
 use std::fmt;
@@ -1446,6 +1445,11 @@ fn set_blocking<T: AsRawFd>(fd: &T) -> io::Result<()> {
     }
 }
 
+cfg_io_uring! {
+
+use crate::runtime::driver::op::Op;
+
+
 pub fn make_uring_pipe() -> io::Result<(UringSender, UringReceiver)> {
     unsafe {
         let mut fds = [-1i32; 2];
@@ -1470,7 +1474,7 @@ impl UringSender {
 
     pub fn submit_write(&self, buf: Buf) -> SenderWriteOp {
         SenderWriteOp {
-            fd: Arc::new(self.fd.clone()),
+            fd: Some(Arc::new(self.fd.clone())),
             state: Some(WriteOpState::Pending(buf)),
         }
     }
@@ -1479,12 +1483,17 @@ impl UringSender {
         let mut total_written = 0;
         let mut buf = Buf::from_vec(buf);
 
+        let mut fd: Arc<dyn AsRawFd + Sync + Send> = self.fd.clone();
+
         loop {
             if buf.is_empty() {
                 return (Ok(total_written), buf.into_vec());
             }
 
-            let (res, _buf) = self.submit_write(buf).await;
+            let write_op = SenderWriteOp::new(fd, buf);
+
+            let (res, _buf, _fd) = write_op.await;
+            fd = _fd;
             if res.is_err() {
                 return (res, _buf.into_vec());
             }
@@ -1515,21 +1524,22 @@ impl UringReceiver {
     }
 
     pub fn submit_read(&self, buf: Vec<u8>) -> ReceiverReadOp {
-        ReceiverReadOp {
-            fd: Arc::new(self.fd.clone()),
-            state: Some(ReadOpState::Pending(buf)),
-        }
+        ReceiverReadOp::new(self.fd.clone(), buf)
     }
 
     pub async fn read_all(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         let mut total_read = 0;
+        let mut fd: Arc<dyn AsRawFd + Sync + Send> = self.fd.clone();
 
         loop {
             if buf.capacity() == buf.len() {
                 return (Ok(total_read), buf);
             }
 
-            let (res, _buf) = self.submit_read(buf).await;
+            let read_op = ReceiverReadOp::new(fd, buf);
+            let (res, _buf, _fd) = read_op.await;
+            fd = _fd;
+
             if res.is_err() {
                 return (res, _buf);
             }
@@ -1556,12 +1566,22 @@ enum WriteOpState {
 }
 
 struct SenderWriteOp {
-    fd: Arc<dyn AsRawFd + Sync + Send>,
     state: Option<WriteOpState>,
+    // fd is present when state is Some(Pending)
+    fd: Option<Arc<dyn AsRawFd + Sync + Send>>,
+}
+
+impl SenderWriteOp {
+    fn new(fd: Arc<dyn AsRawFd + Sync + Send>, buf: Buf) -> Self {
+        SenderWriteOp {
+            state: Some(WriteOpState::Pending(buf)),
+            fd: Some(fd),
+        }
+    }
 }
 
 impl Future for SenderWriteOp {
-    type Output = (io::Result<usize>, Buf);
+    type Output = (io::Result<usize>, Buf, Arc<dyn AsRawFd + Sync + Send>);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -1571,20 +1591,22 @@ impl Future for SenderWriteOp {
 
             match self.state.take().unwrap() {
                 WriteOpState::Pending(buf) => {
+                    // we have the fd when pending
+                    let fd = self.fd.take().unwrap();
                     if buf.is_empty() {
-                        return Poll::Ready((Ok(0), buf));
+                        return Poll::Ready((Ok(0), buf, fd));
                     }
 
-                    let op = Op::write_at(Arc::clone(&self.fd), buf, 0);
+                    let op = Op::write_at(fd, buf, 0);
                     self.state = Some(WriteOpState::InProgress(op));
                 }
                 WriteOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
                     Poll::Ready(Ok(n)) => {
-                        let (written, buf, _) = n;
-                        return Poll::Ready((Ok(written as usize), buf));
+                        let (written, buf, fd) = n;
+                        return Poll::Ready((Ok(written as usize), buf, fd));
                     }
                     Poll::Ready(Err(e)) => {
-                        return Poll::Ready((Err(e.0), e.1.0));
+                        return Poll::Ready((Err(e.0), e.1.0, e.1.1));
                     }
                     Poll::Pending => {
                         self.state = Some(WriteOpState::InProgress(op));
@@ -1602,12 +1624,22 @@ enum ReadOpState {
 }
 
 struct ReceiverReadOp {
-    fd: Arc<dyn AsRawFd + Sync + Send>,
     state: Option<ReadOpState>,
+    // fd is present when state is Some(Pending)
+    fd: Option<Arc<dyn AsRawFd + Sync + Send>>
+}
+
+impl ReceiverReadOp {
+    fn new(fd: Arc<dyn AsRawFd + Sync + Send>, buf: Vec<u8>) -> Self {
+        ReceiverReadOp {
+            state: Some(ReadOpState::Pending(buf)),
+            fd: Some(fd),
+        }
+    }
 }
 
 impl Future for ReceiverReadOp {
-    type Output = (io::Result<usize>, Vec<u8>);
+    type Output = (io::Result<usize>, Vec<u8>, Arc<dyn AsRawFd + Sync + Send>);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -1617,20 +1649,22 @@ impl Future for ReceiverReadOp {
 
             match self.state.take().unwrap() {
                 ReadOpState::Pending(buf) => {
+                    // if we are pending, we have the fd
+                    let fd = self.fd.take().unwrap();
                     if buf.capacity() == buf.len() {
-                        return Poll::Ready((Ok(0), buf));
+                        return Poll::Ready((Ok(0), buf, fd));
                     }
 
-                    let op = Op::read_at(Arc::clone(&self.fd), buf, 0);
+                    let op = Op::read_at(fd, buf, 0);
                     self.state = Some(ReadOpState::InProgress(op));
                 }
                 ReadOpState::InProgress(mut op) => match Pin::new(&mut op).poll(cx) {
                     Poll::Ready(Ok(n)) => {
-                        let (read, buf, _) = n;
-                        return Poll::Ready((Ok(read as usize), buf));
+                        let (read, buf, fd) = n;
+                        return Poll::Ready((Ok(read as usize), buf, fd));
                     }
                     Poll::Ready(Err(e)) => {
-                        return Poll::Ready((Err(e.0), e.1.0));
+                        return Poll::Ready((Err(e.0), e.1.0, e.1.1));
                     }
                     Poll::Pending => {
                         self.state = Some(ReadOpState::InProgress(op));
@@ -1640,4 +1674,7 @@ impl Future for ReceiverReadOp {
             };
         }
     }
+}
+
+
 }

@@ -3,8 +3,9 @@ cfg_signal_internal_and_unix! {
     mod signal;
 }
 cfg_io_uring! {
-    mod uring;
+    pub(crate) mod uring;
     use crate::runtime::io::driver::uring::UringState;
+    use crate::loom::sync::atomic::AtomicBool;
 }
 
 use crate::io::interest::Interest;
@@ -52,6 +53,8 @@ pub(crate) struct Handle {
 
     #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
     pub(crate) uring_state: Mutex<UringState>,
+    #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+    cached_uring_usable: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -128,6 +131,8 @@ impl Driver {
             } else {
                 uring::UringState::Disabled
             }),
+            #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+            cached_uring_usable: AtomicBool::new(false),
         };
 
         Ok((driver, handle))
@@ -153,7 +158,7 @@ impl Driver {
         }
     }
 
-    fn turn(&mut self, handle: &Handle, max_wait: Option<Duration>) {
+    fn turn(&mut self, handle: &Handle, mut max_wait: Option<Duration>) {
         debug_assert!(!handle.registrations.is_shutdown(&handle.synced.lock()));
 
         handle.release_pending_registrations();
@@ -162,7 +167,20 @@ impl Driver {
 
         // Block waiting for an event to happen, peeling out how many events
         // happened.
-        // self.poll.registry().register(source, token, interests)
+
+        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+        {
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            tracing::trace!("driver turn, dispatching uring completions");
+            if handle
+                .with_uring(|ctx| ctx.dispatch_completions(true))
+                .unwrap_or(0)
+                > 0
+            {
+                // if we had any completions, we dont wait in the poll but do process events
+                max_wait = Some(Duration::from_millis(0));
+            }
+        }
 
         match self.poll.poll(events, max_wait) {
             Ok(()) => {}
@@ -205,7 +223,7 @@ impl Driver {
         {
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             tracing::trace!("driver turn, dispatching uring completions");
-            let _ = handle.with_uring(|ctx| ctx.dispatch_completions());
+            let _ = handle.with_uring(|ctx| ctx.dispatch_completions(false));
         }
 
         handle.metrics.incr_ready_count_by(ready_count);

@@ -117,7 +117,7 @@ enum JoinHandleInner<T> {
     Async(BoxedOp<T>),
 }
 
-struct BoxedOp<T>(Pin<Box<dyn Future<Output = T> + Send + 'static>>);
+struct BoxedOp<T>(Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>>);
 
 impl<T> std::fmt::Debug for BoxedOp<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

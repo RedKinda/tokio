@@ -304,11 +304,11 @@ impl CachedParkThread {
 
             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
             {
-                use crate::runtime::context::with_current;
+                use crate::runtime::io::uring::with_current_uring;
                 let completions_dispatched =
-                    with_current(|c| c.driver().io.drive_uring_completions()).unwrap_or(false);
+                    with_current_uring(|uring| uring.dispatch_completions(true)).unwrap_or(0);
 
-                if completions_dispatched {
+                if completions_dispatched > 0 {
                     continue;
                 }
             }

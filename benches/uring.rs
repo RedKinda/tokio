@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use tokio::net::unix::pipe::{self, UringReceiver, UringSender, make_uring_pipe};
+use tokio::net::unix::pipe::{self, make_uring_pipe, UringReceiver, UringSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -8,7 +8,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use std::fs::File as StdFile;
 use std::io::Read as StdRead;
@@ -163,7 +163,7 @@ fn async_many_pipes_split(c: &mut Criterion) {
     c.bench_function("async_many_pipes_split", |b| {
         b.iter_custom(|iters| {
             rt.block_on(async {
-                let pipe_count = 32;
+                let pipe_count = 64;
                 let send_count = 10;
                 let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -171,8 +171,8 @@ fn async_many_pipes_split(c: &mut Criterion) {
 
                 for _ in 0..pipe_count {
                     let (tx, rx) = make_pipe();
-                    let tx_buf = vec![1u8; 100 * 1024];
-                    let rx_buf = vec![0u8; 100 * 1024];
+                    let tx_buf = vec![1u8; 10 * 1024];
+                    let rx_buf = vec![0u8; 10 * 1024];
 
                     handles.push(stress_pipe_split(tx, rx, tx_buf, rx_buf, iters, send_count));
                 }

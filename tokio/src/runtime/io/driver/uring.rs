@@ -3,6 +3,7 @@ use mio::unix::SourceFd;
 use slab::Slab;
 
 use crate::io::Interest;
+use crate::loom::sync::atomic::AtomicBool;
 use crate::runtime::driver::op::{CancelData, CqeResult};
 use crate::runtime::io::scheduled_io::ScheduledIo;
 use crate::sync::oneshot;
@@ -27,6 +28,7 @@ pub(crate) struct UringContextInner {
     pub(crate) uring: io_uring::IoUring,
     pub(crate) ops: slab::Slab<(CqeSender, CancelData)>,
     io_waking: (Waker, Arc<ScheduledIo>),
+    pending_request_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,7 @@ impl UringContextInner {
             uring,
             ops: Slab::with_capacity(DEFAULT_RING_SIZE as usize),
             io_waking: (waker, scheduled_io),
+            pending_request_count: 0,
         };
 
         #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -104,8 +107,12 @@ impl UringContextInner {
         Ok(s)
     }
 
-    pub(crate) fn dispatch_completions(&mut self) -> usize {
+    pub(crate) fn dispatch_completions(&mut self, before_park: bool) -> usize {
         let ops = &mut self.ops;
+
+        if self.pending_request_count == 0 {
+            return 0;
+        }
 
         let mut dispatched = 0;
 
@@ -116,8 +123,7 @@ impl UringContextInner {
         // once its Poll::Pending, ScheduledIo has our thread waker so we will be notified on new completions
 
         let mut do_dispatch = || {
-            let mut cq = self.uring.completion();
-            cq.sync();
+            let cq = self.uring.completion();
 
             for cqe in cq {
                 dispatched += 1;
@@ -135,17 +141,16 @@ impl UringContextInner {
             }
         };
 
-        let mut ran_once = false;
-        while let Poll::Ready(ready) = scheduled_io.poll_readiness(&mut cx, super::Direction::Read)
-        {
-            scheduled_io.clear_readiness(ready);
-            do_dispatch();
-            ran_once = true;
-        }
+        if before_park {
+            while let Poll::Ready(ready) =
+                scheduled_io.poll_readiness(&mut cx, super::Direction::Read)
+            {
+                scheduled_io.clear_readiness(ready);
 
-        // ensure we always dispatch at least once
-        if !ran_once {
-            // do_dispatch();
+                do_dispatch();
+            }
+        } else {
+            do_dispatch();
         }
 
         #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -154,6 +159,8 @@ impl UringContextInner {
         } else {
             tracing::trace!("no completions to dispatch");
         }
+
+        self.pending_request_count -= dispatched;
 
         dispatched
 
@@ -170,7 +177,7 @@ impl UringContextInner {
 
                 // If the submission queue is full, we dispatch completions and try again.
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions();
+                    self.dispatch_completions(false);
                 }
                 // For other errors, we currently return the error as is.
                 Err(e) => {
@@ -178,6 +185,54 @@ impl UringContextInner {
                 }
             }
         }
+    }
+
+    /// Register an operation with the io_uring.
+    ///
+    /// If this is the first io_uring operation, it will also initialize the io_uring context.
+    /// If io_uring isn't supported, this function returns an `ENOSYS` error, so the caller can
+    /// perform custom handling, such as falling back to an alternative mechanism.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
+    /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
+    pub(crate) unsafe fn register_op(
+        &mut self,
+        entry: Entry,
+        sender: CqeSender,
+        cancel_data: CancelData,
+    ) -> Result<usize, (io::Error, CancelData)> {
+        let index = self.ops.insert((sender, cancel_data));
+        let entry = entry.user_data(index as u64);
+
+        let submit_or_remove =
+            |ctx: &mut UringContextInner| -> Result<(), (io::Error, CancelData)> {
+                if let Err(e) = ctx.submit() {
+                    // Submission failed, remove the entry from the slab and return the error
+                    let (_, data) = ctx.remove_op(index);
+                    return Err((e, data));
+                }
+                Ok(())
+            };
+
+        // SAFETY: entry is valid for the entire duration of the operation
+        while unsafe { self.uring.submission().push(&entry).is_err() } {
+            // If the submission queue is full, flush it to the kernel
+            submit_or_remove(self)?;
+        }
+
+        // Ensure that the completion queue is not full before submitting the entry.
+        while self.uring.completion().is_full() {
+            self.dispatch_completions(false);
+        }
+
+        // Note: For now, we submit the entry immediately without utilizing batching.
+        submit_or_remove(self)?;
+
+        self.pending_request_count += 1;
+
+        Ok(index)
     }
 
     pub(crate) fn remove_op(&mut self, index: usize) -> (CqeSender, CancelData) {
@@ -209,7 +264,33 @@ impl Drop for UringContextInner {
     }
 }
 
-tokio_thread_local!(static URING_CTX: OnceCell<RefCell<UringContext>> = OnceCell::new());
+tokio_thread_local!(static URING_CTX: OnceCell<RefCell<UringContext>> = const { OnceCell::new() });
+
+pub(crate) fn with_current_uring<F, R>(f: F) -> Result<R, io::Error>
+where
+    F: FnOnce(&mut UringContextInner) -> R,
+{
+    URING_CTX.with(|cell| {
+        let cell = cell.get();
+
+        if cell.is_none() {
+            // this should be unreachable
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "io_uring context is not yet initialized",
+            ));
+        }
+
+        let mut ctx = cell.unwrap().borrow_mut();
+        match &mut ctx.inner {
+            Ok(uring_inner) => Ok(f(uring_inner)),
+            Err(e) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("io_uring context previously failed to initialize: {e:?}"),
+            )),
+        }
+    })
+}
 
 impl Handle {
     fn add_uring_source(&self, uringfd: RawFd) -> io::Result<Arc<ScheduledIo>> {
@@ -223,30 +304,11 @@ impl Handle {
         //     .register(&mut source, TOKEN_WAKEUP_ALL, Interest::READABLE.to_mio())
     }
 
-    pub(crate) fn with_uring<F, R>(&self, f: F) -> Result<R, io::Error>
+    pub(crate) fn with_uring<F, R>(&self, f: F) -> io::Result<R>
     where
         F: FnOnce(&mut UringContextInner) -> R,
     {
-        URING_CTX.with(|cell| {
-            let cell = cell.get();
-
-            if cell.is_none() {
-                // this should be unreachable
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "io_uring context is not yet initialized",
-                ));
-            }
-
-            let mut ctx = cell.unwrap().borrow_mut();
-            match &mut ctx.inner {
-                Ok(uring_inner) => Ok(f(uring_inner)),
-                Err(e) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("io_uring context previously failed to initialize: {e:?}"),
-                )),
-            }
-        })
+        with_current_uring(f)
     }
 
     pub(crate) fn init_uring(&self, waker: Waker) -> io::Result<bool> {
@@ -309,6 +371,7 @@ impl Handle {
                     // if error is ENOSYS, we mark uring as unsupported
                     if e.raw_os_error() == Some(libc::ENOSYS) {
                         *uring_state = UringState::Unsupported;
+                        self.cached_uring_usable.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -320,6 +383,7 @@ impl Handle {
                     *uring_state = UringState::Initialized(
                         ctx.borrow().inner.as_ref().unwrap().uring.as_raw_fd(),
                     );
+                    self.cached_uring_usable.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // cell was inited previously
                 None => {
@@ -347,6 +411,7 @@ impl Handle {
                     }
 
                     *uring_state = UringState::Initialized(uring_inner.uring.as_raw_fd());
+                    self.cached_uring_usable.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -356,85 +421,34 @@ impl Handle {
 
     /// Check if the io_uring context is available
     pub(crate) fn check_uring(&self) -> io::Result<bool> {
-        let uring_state = self.uring_state.lock().clone();
-
-        match uring_state {
-            UringState::Initialized(_) => {
-                // Already initialized.
-                Ok(true)
-            }
-            UringState::Unsupported => {
-                // Not supported on this machine.
-                Ok(false)
-            }
-            UringState::Disabled => {
-                // Disabled manually.
-                Ok(false)
-            }
-            UringState::Uninitialized => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "io_uring context is not initialized",
-            )),
-        }
-    }
-
-    /// Register an operation with the io_uring.
-    ///
-    /// If this is the first io_uring operation, it will also initialize the io_uring context.
-    /// If io_uring isn't supported, this function returns an `ENOSYS` error, so the caller can
-    /// perform custom handling, such as falling back to an alternative mechanism.
-    ///
-    /// # Safety
-    ///
-    /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
-    /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
-    pub(crate) unsafe fn register_op(
-        &self,
-        entry: Entry,
-        sender: CqeSender,
-        cancel_data: CancelData,
-    ) -> Result<usize, (io::Error, CancelData)> {
-        // Note: Maybe this check can be removed if upstream callers consistently use `check_and_init`.
-        let check = self.check_uring();
-        if let Err(e) = check {
-            return Err((e, cancel_data));
-        }
-        if !check.unwrap() {
-            return Err((io::Error::from_raw_os_error(libc::ENOSYS), cancel_data));
+        // early return, common path
+        if self
+            .cached_uring_usable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(true);
         }
 
-        // Uring is initialized.
+        URING_CTX.with(|cell| {
+            let cell_inner = cell.get();
+            if cell_inner.is_none() {
+                // init_uring should always have been called before this, so None means it was Disabled or Unsupported
+                return Ok(false);
+            }
 
-        self.with_uring(|ctx| {
-            let index = ctx.ops.insert((sender, cancel_data));
-            let entry = entry.user_data(index as u64);
-
-            let submit_or_remove =
-                |ctx: &mut UringContextInner| -> Result<(), (io::Error, CancelData)> {
-                    if let Err(e) = ctx.submit() {
-                        // Submission failed, remove the entry from the slab and return the error
-                        let (_, data) = ctx.remove_op(index);
-                        return Err((e, data));
+            match &cell_inner.unwrap().borrow().inner {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::ENOSYS) {
+                        Ok(false)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("io_uring context failed to initialize: {e:?}"),
+                        ))
                     }
-                    Ok(())
-                };
-
-            // SAFETY: entry is valid for the entire duration of the operation
-            while unsafe { ctx.uring.submission().push(&entry).is_err() } {
-                // If the submission queue is full, flush it to the kernel
-                submit_or_remove(ctx)?;
+                }
             }
-
-            // Ensure that the completion queue is not full before submitting the entry.
-            while ctx.uring.completion().is_full() {
-                ctx.dispatch_completions();
-            }
-
-            // Note: For now, we submit the entry immediately without utilizing batching.
-            submit_or_remove(ctx)?;
-
-            Ok(index)
         })
-        .expect("uring was checked as initialized")
     }
 }

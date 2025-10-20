@@ -1,20 +1,20 @@
-use crate::loom::sync::Arc;
 use crate::loom::sync::atomic::AtomicBool;
+use crate::loom::sync::Arc;
 use crate::runtime::driver::{self, Driver};
 use crate::runtime::scheduler::{self, Defer, Inject};
 use crate::runtime::task::{
     self, JoinHandle, OwnedTasks, Schedule, SpawnLocation, Task, TaskHarnessScheduleHooks,
 };
 use crate::runtime::{
-    Config, MetricsBatch, SchedulerMetrics, TaskHooks, TaskMeta, WorkerMetrics, blocking, context,
+    blocking, context, Config, MetricsBatch, SchedulerMetrics, TaskHooks, TaskMeta, WorkerMetrics,
 };
 use crate::sync::notify::Notify;
 use crate::util::atomic_cell::AtomicCell;
-use crate::util::{RngSeedGenerator, Wake, WakerRef, waker_ref};
+use crate::util::{waker_ref, RngSeedGenerator, Wake, WakerRef};
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::{Future, poll_fn};
+use std::future::{poll_fn, Future};
 use std::sync::atomic::Ordering::{AcqRel, Release};
 use std::task::Poll::{Pending, Ready};
 use std::task::Waker;
@@ -386,7 +386,7 @@ impl Context {
         #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
         {
             let (c, completions_dispatched_inner) =
-                self.enter(core, || handle.driver.io.drive_uring_completions());
+                self.enter(core, || handle.driver.io.drive_uring_completions(true));
             core = c;
             completions_dispatched = completions_dispatched_inner;
         }
@@ -783,7 +783,7 @@ impl CoreGuard<'_> {
                             #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
                             {
                                 let (c, res) = context.enter(core, || {
-                                    context.handle.driver.io.drive_uring_completions()
+                                    context.handle.driver.io.drive_uring_completions(true)
                                 });
 
                                 core = c;

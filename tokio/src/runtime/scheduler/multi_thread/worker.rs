@@ -60,12 +60,12 @@ use crate::loom::sync::{Arc, Mutex};
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::park::MultiThreadUnpark;
 use crate::runtime::scheduler::multi_thread::{
-    Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker, idle, queue,
+    idle, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
 };
-use crate::runtime::scheduler::{Defer, Lock, inject};
+use crate::runtime::scheduler::{inject, Defer, Lock};
 use crate::runtime::task::OwnedTasks;
-use crate::runtime::{Config, SchedulerMetrics, WorkerMetrics, blocking, driver, scheduler, task};
-use crate::runtime::{TaskHooks, context};
+use crate::runtime::{blocking, driver, scheduler, task, Config, SchedulerMetrics, WorkerMetrics};
+use crate::runtime::{context, TaskHooks};
 use crate::task::coop;
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::{FastRand, RngSeedGenerator};
@@ -581,7 +581,7 @@ impl Context {
                 core = self.run_task(task, core)?;
             } else {
                 #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-                if self.worker.handle.driver.io.drive_uring_completions() {
+                if self.worker.handle.driver.io.drive_uring_completions(true) {
                     continue;
                 }
 
@@ -594,7 +594,7 @@ impl Context {
                 core.stats.start_processing_scheduled_tasks();
 
                 #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-                let _ = self.worker.handle.driver.io.drive_uring_completions();
+                let _ = self.worker.handle.driver.io.drive_uring_completions(false);
             }
         }
 
@@ -766,11 +766,11 @@ impl Context {
             f();
         }
 
-        #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-        let _ = self.worker.handle.driver.io.drive_uring_completions();
-
         if core.transition_to_parked(&self.worker) {
             while !core.is_shutdown && !core.is_traced {
+                #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
+                self.worker.handle.driver.io.drive_uring_completions(true);
+
                 core.stats.about_to_park();
                 core.stats
                     .submit(&self.worker.handle.shared.worker_metrics[self.worker.index]);
@@ -1048,7 +1048,7 @@ impl Core {
         }
 
         #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux",))]
-        let _ = worker.handle.driver.io.drive_uring_completions();
+        let _ = worker.handle.driver.io.drive_uring_completions(false);
     }
 
     /// Signals all tasks to shut down, and waits for them to complete. Must run
