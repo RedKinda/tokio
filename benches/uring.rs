@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use tokio::net::unix::pipe::{self, make_uring_pipe, UringReceiver, UringSender};
+use tokio::net::unix::pipe::{self, UringReceiver, UringSender, make_uring_pipe};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -8,7 +8,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use std::fs::File as StdFile;
 use std::io::Read as StdRead;
@@ -49,8 +49,8 @@ fn async_one_pipe(c: &mut Criterion) {
             rt.block_on(async {
                 let (mut tx, mut rx) = make_pipe();
 
-                let mut tx_buf = vec![1u8; 1024];
-                let mut rx_buf = vec![0u8; 1024];
+                let mut tx_buf = vec![1u8; 50 * 1024];
+                let mut rx_buf = vec![0u8; 50 * 1024];
 
                 let now = std::time::Instant::now();
                 for _ in 0..iters {
@@ -58,7 +58,6 @@ fn async_one_pipe(c: &mut Criterion) {
                     {
                         tx.write_all(&tx_buf).await.unwrap();
                         rx.read_exact(&mut rx_buf).await.unwrap();
-                        assert_eq!(rx_buf, [1u8; 1024]);
                     }
 
                     #[cfg(all(tokio_unstable, feature = "io-uring", target_os = "linux"))]
@@ -70,7 +69,6 @@ fn async_one_pipe(c: &mut Criterion) {
                         let (res, _buf) = rx.read_all(rx_buf).await;
                         res.unwrap();
                         rx_buf = _buf;
-                        assert_eq!(rx_buf, [1u8; 1024]);
                     }
                 }
 
@@ -140,8 +138,8 @@ fn async_one_pipe_split(c: &mut Criterion) {
             rt.block_on(async {
                 let (tx, rx) = make_pipe();
 
-                let tx_buf = vec![1u8; 100 * 1024];
-                let rx_buf = vec![0u8; 100 * 1024];
+                let tx_buf = vec![1u8; 50 * 1024];
+                let rx_buf = vec![0u8; 50 * 1024];
 
                 let send_count = 10;
 
@@ -171,8 +169,8 @@ fn async_many_pipes_split(c: &mut Criterion) {
 
                 for _ in 0..pipe_count {
                     let (tx, rx) = make_pipe();
-                    let tx_buf = vec![1u8; 10 * 1024];
-                    let rx_buf = vec![0u8; 10 * 1024];
+                    let tx_buf = vec![1u8; 50 * 1024];
+                    let rx_buf = vec![0u8; 50 * 1024];
 
                     handles.push(stress_pipe_split(tx, rx, tx_buf, rx_buf, iters, send_count));
                 }

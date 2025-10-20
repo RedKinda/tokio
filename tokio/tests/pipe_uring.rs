@@ -18,7 +18,7 @@ use std::{future::poll_fn, path::PathBuf};
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::net::unix::pipe::{make_uring_pipe, UringReceiver, UringSender};
+use tokio::net::unix::pipe::{UringReceiver, UringSender, make_uring_pipe};
 use tokio::task::JoinHandle;
 use tokio::{
     fs::OpenOptions,
@@ -68,11 +68,11 @@ where
     R::Output: Send,
 {
     // tracing_subscriber::fmt()
-    //     .with_max_level(tracing::Level::TRACE)
-    //     .with_thread_ids(true)
-    //     .with_thread_names(true)
-    //     .with_ansi(false)
-    //     .try_init();
+    // .with_max_level(tracing::Level::TRACE)
+    // .with_thread_ids(true)
+    // .with_thread_names(true)
+    // // .with_ansi(false)
+    // .try_init();
 
     let test_name = std::thread::current()
         .name()
@@ -99,19 +99,20 @@ fn test_uring_pipe() {
     with_rt_combinations(&|| async {
         let (tx, rx) = make_uring_pipe().unwrap();
 
-        let mut tx_buf = vec![1u8; 1024];
-        let mut rx_buf = vec![0u8; 1024];
+        // pipes usually have a capacity of 64KiB on Linux
+        // if we try to write more, and block, the test will deadlock
+        let mut tx_buf = vec![1u8; 50 * 1024];
+        let mut rx_buf = vec![0u8; 50 * 1024];
 
         for _ in 0..32 {
             let (res, _buf) = tx.write_all(tx_buf).await;
             let res = res.unwrap();
             tx_buf = _buf;
-            println!("written {res} bytes");
             rx_buf.truncate(0);
             let (res, _buf) = rx.read_all(rx_buf).await;
             res.unwrap();
             rx_buf = _buf;
-            assert_eq!(rx_buf, [1u8; 1024])
+            assert_eq!(rx_buf, [1u8; 50 * 1024])
         }
     });
 }

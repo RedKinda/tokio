@@ -34,6 +34,25 @@ fn stress_pipe_split(
     })
 }
 
+async fn test_pingpong() {
+    let (tx, rx) = make_uring_pipe().unwrap();
+
+    let mut tx_buf = vec![1u8; 10 * 1024];
+    let mut rx_buf = vec![0u8; 10 * 1024];
+
+    let iters = 10000000;
+
+    for _ in 0..iters {
+        let (res, _buf) = tx.write_all(tx_buf).await;
+        res.unwrap();
+        tx_buf = _buf;
+        rx_buf.truncate(0);
+        let (res, _buf) = rx.read_all(rx_buf).await;
+        res.unwrap();
+        rx_buf = _buf;
+    }
+}
+
 async fn test_single_pipe() {
     let (tx, rx) = make_uring_pipe().unwrap();
 
@@ -83,7 +102,7 @@ fn main() {
     let elapsed = rt.block_on(async move {
         let now = std::time::Instant::now();
 
-        test_single_pipe().await;
+        test_pingpong().await;
 
         now.elapsed()
     });

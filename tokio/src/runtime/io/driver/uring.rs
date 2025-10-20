@@ -75,7 +75,8 @@ impl UringContextInner {
             }
 
             uring.setup_single_issuer();
-            uring.setup_coop_taskrun();
+            // uring.setup_coop_taskrun();
+            // uring.setup_sqpoll(10);
 
             uring.build(DEFAULT_RING_SIZE)
         };
@@ -142,11 +143,18 @@ impl UringContextInner {
         };
 
         if before_park {
+            let mut did_dispatch = false;
+
             while let Poll::Ready(ready) =
                 scheduled_io.poll_readiness(&mut cx, super::Direction::Read)
             {
                 scheduled_io.clear_readiness(ready);
+                did_dispatch = true;
+                do_dispatch();
+            }
 
+            if !did_dispatch {
+                // we ensure we dispatch at least once
                 do_dispatch();
             }
         } else {

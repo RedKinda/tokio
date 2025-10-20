@@ -93,7 +93,11 @@ impl<T: Cancellable + Completable + Send + std::fmt::Debug> Future for Op<T> {
 
                 crate::runtime::io::uring::with_current_uring(|uring| {
                     #[cfg(all(tokio_unstable, feature = "tracing"))]
-                    tracing::trace!("registering uring op {} - {:?}", type_name::<T>(), &entry);
+                    tracing::trace!(
+                        "registering uring op {} - {:?}",
+                        std::any::type_name::<T>(),
+                        &entry
+                    );
 
                     // SAFETY: entry is valid for the entire duration of the operation
                     unsafe {
