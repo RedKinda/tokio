@@ -2,7 +2,7 @@
 //!
 //! [`File`]: File
 
-use crate::fs::{OpenOptions, asyncify};
+use crate::fs::{asyncify, OpenOptions};
 use crate::io::blocking::{Buf, DEFAULT_MAX_BUF_SIZE};
 use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use crate::sync::Mutex;
@@ -15,7 +15,7 @@ use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 
 #[cfg(test)]
 use super::mocks::JoinHandle;
@@ -117,7 +117,7 @@ enum JoinHandleInner<T> {
     Async(BoxedOp<T>),
 }
 
-struct BoxedOp<T>(Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>>);
+struct BoxedOp<T>(Pin<Box<dyn Future<Output = T> + Send + 'static>>);
 
 impl<T> std::fmt::Debug for BoxedOp<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -826,7 +826,7 @@ impl AsyncWrite for File {
                                     let handle = BoxedOp(Box::pin(async move {
                                         match op.await {
                                             Ok(n) => (Operation::Write(Ok(())), n.1),
-                                            Err(e) => (Operation::Write(Err(e.0)), e.1.0),
+                                            Err(e) => (Operation::Write(Err(e.0)), e.1 .0),
                                         }
                                     }));
 

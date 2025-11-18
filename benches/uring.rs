@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use tokio::net::unix::pipe::{self, UringReceiver, UringSender, make_uring_pipe};
+use tokio::net::unix::pipe::{self, make_uring_pipe, UringReceiver, UringSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -8,7 +8,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use std::fs::File as StdFile;
 use std::io::Read as StdRead;

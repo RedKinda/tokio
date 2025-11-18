@@ -245,7 +245,7 @@ mod read;
 pub use self::read::read;
 
 mod read_dir;
-pub use self::read_dir::{DirEntry, ReadDir, read_dir};
+pub use self::read_dir::{read_dir, DirEntry, ReadDir};
 
 mod read_link;
 pub use self::read_link::read_link;

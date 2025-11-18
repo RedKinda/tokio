@@ -1,5 +1,5 @@
 use tokio::{
-    net::unix::pipe::{UringReceiver, UringSender, make_uring_pipe},
+    net::unix::pipe::{make_uring_pipe, UringReceiver, UringSender},
     task::JoinHandle,
 };
 
@@ -35,7 +35,7 @@ fn stress_pipe_split(
 }
 
 async fn test_pingpong() {
-    let (tx, rx) = make_uring_pipe().unwrap();
+    let (mut tx, mut rx) = make_uring_pipe().unwrap();
 
     let mut tx_buf = vec![1u8; 10 * 1024];
     let mut rx_buf = vec![0u8; 10 * 1024];
@@ -93,7 +93,7 @@ fn main() {
     // #[cfg(feature = "tracing")]
     // compile_error!("rahh");
 
-    let mut r = tokio::runtime::Builder::new_multi_thread();
+    let mut r = tokio::runtime::Builder::new_current_thread();
 
     let r = r.enable_io_uring();
 
@@ -102,7 +102,8 @@ fn main() {
     let elapsed = rt.block_on(async move {
         let now = std::time::Instant::now();
 
-        test_pingpong().await;
+        test_single_pipe().await;
+        // test_multi_pipe().await;
 
         now.elapsed()
     });

@@ -2,7 +2,6 @@ use crate::io::uring::open::Open;
 use crate::io::uring::read::Read;
 use crate::io::uring::write::Write;
 use crate::io::uring::write::WriteVectored;
-use crate::sync::oneshot;
 use io_uring::cqueue;
 use io_uring::squeue::Entry;
 use std::future::Future;

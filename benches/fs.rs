@@ -6,7 +6,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::codec::{BytesCodec, FramedRead /*FramedWrite*/};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use std::fs::File as StdFile;
 use std::io::Read as StdRead;

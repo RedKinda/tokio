@@ -1,4 +1,4 @@
-use crate::fs::{File, asyncify};
+use crate::fs::{asyncify, File};
 
 use std::io;
 use std::path::Path;

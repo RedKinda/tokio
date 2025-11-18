@@ -18,7 +18,7 @@ use std::{future::poll_fn, path::PathBuf};
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::net::unix::pipe::{UringReceiver, UringSender, make_uring_pipe};
+use tokio::net::unix::pipe::{make_uring_pipe, UringReceiver, UringSender};
 use tokio::task::JoinHandle;
 use tokio::{
     fs::OpenOptions,

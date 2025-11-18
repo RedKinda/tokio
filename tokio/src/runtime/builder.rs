@@ -1,9 +1,9 @@
 #![cfg_attr(loom, allow(unused_imports))]
 
 use crate::runtime::handle::Handle;
-use crate::runtime::{Callback, HistogramBuilder, Runtime, TaskCallback, blocking, driver};
+use crate::runtime::{blocking, driver, Callback, HistogramBuilder, Runtime, TaskCallback};
 #[cfg(tokio_unstable)]
-use crate::runtime::{LocalOptions, LocalRuntime, TaskMeta, metrics::HistogramConfiguration};
+use crate::runtime::{metrics::HistogramConfiguration, LocalOptions, LocalRuntime, TaskMeta};
 use crate::util::rand::{RngSeed, RngSeedGenerator};
 
 use crate::runtime::blocking::BlockingPool;
@@ -1549,8 +1549,8 @@ impl Builder {
         &mut self,
         local_tid: Option<ThreadId>,
     ) -> io::Result<(CurrentThread, Handle, BlockingPool)> {
-        use crate::runtime::Config;
         use crate::runtime::scheduler;
+        use crate::runtime::Config;
 
         let (driver, driver_handle) = driver::Driver::new(self.get_cfg())?;
 

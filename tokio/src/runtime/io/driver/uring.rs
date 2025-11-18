@@ -1,4 +1,4 @@
-use io_uring::{IoUring, squeue::Entry};
+use io_uring::{squeue::Entry, IoUring};
 use mio::unix::SourceFd;
 use slab::Slab;
 
@@ -6,7 +6,6 @@ use crate::io::Interest;
 use crate::loom::sync::atomic::AtomicBool;
 use crate::runtime::driver::op::{CancelData, CqeResult};
 use crate::runtime::io::scheduled_io::ScheduledIo;
-use crate::sync::oneshot;
 
 use super::Handle;
 
@@ -125,9 +124,10 @@ impl UringContextInner {
 
         let mut do_dispatch = || {
             let cq = self.uring.completion();
+            let mut just_dispatched = 0;
 
             for cqe in cq {
-                dispatched += 1;
+                just_dispatched += 1;
                 let idx = cqe.user_data() as usize;
 
                 match ops.try_remove(idx) {
@@ -140,6 +140,8 @@ impl UringContextInner {
                     }
                 }
             }
+
+            just_dispatched
         };
 
         if before_park {
@@ -150,12 +152,20 @@ impl UringContextInner {
             {
                 scheduled_io.clear_readiness(ready);
                 did_dispatch = true;
-                do_dispatch();
+                dispatched += do_dispatch();
             }
 
             if !did_dispatch {
                 // we ensure we dispatch at least once
-                do_dispatch();
+                dispatched += do_dispatch();
+            }
+
+            // if we are before_park, and we didn't dispatch anything, yield
+            // we do this because yielding is a syscall, allowing the kernel to add stuff to the completion queue
+            // that we might be able to read immediately and skip parking
+            if dispatched == 0 {
+                std::thread::yield_now();
+                dispatched += do_dispatch();
             }
         } else {
             do_dispatch();
